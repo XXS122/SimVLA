@@ -12,9 +12,9 @@ set -e
 # Command line arguments (with defaults)
 # =============================================================================
 
-BATCH_SIZE=${1:-64}
+BATCH_SIZE=${1:-8}
 LEARNING_COEF=${2:-0.1}
-OUTPUT_DIR=${3:-./runs/simvla_libero_small}
+OUTPUT_DIR=${3:-/datasets/simvla_output/simvla_libero_small}
 RESUME_CKPT=${4:-""}
 
 echo "Training parameters:"
@@ -24,7 +24,8 @@ echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
 # GPU configuration
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -32,12 +33,12 @@ export TF_CPP_MIN_LOG_LEVEL=2
 # =============================================================================
 # Path configuration
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
+LIBERO_DATA_DIR="/datasets"
 NORM_STATS_PATH="./norm_stats/libero_norm.json"
-TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
+TRAIN_METAS_PATH="/datasets/simvla/libero_train.json"
 
 # SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
+SMOLVLM_MODEL="/datasets/models/base_model"
 
 # =============================================================================
 # Training hyperparameters
@@ -143,7 +144,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=1 \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

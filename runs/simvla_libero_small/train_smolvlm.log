@@ -1,0 +1,29 @@
+13:15:27 | INFO | __main__ | Args: Namespace(models=None, output_dir='./runs/simvla_libero_small', smolvlm_model_path='/datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct', train_metas_path='/datasets/simvla/libero_train.json', batch_size=64, image_size=384, learning_rate=0.0001, learning_coef=0.1, weight_decay=0.0, betas=(0.9, 0.95), max_grad_norm=1.0, iters=200000, freeze_steps=1000, warmup_steps=0, use_cosine_decay=False, min_lr_ratio=0.1, save_interval=10000, log_interval=20, seed=0, action_mode='libero_joint', num_workers=4, norm_stats_path='./norm_stats/libero_norm.json', num_actions=10, wandb_project=None, wandb_api_key=None, resume=False, use_adaln=False, hidden_size=768, depth=12, num_heads=12)
+13:15:27 | INFO | __main__ | Using SmolVLM backbone: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct
+13:15:27 | INFO | __main__ | Image size: 384x384
+13:15:27 | INFO | __main__ | Using normalization stats from: ./norm_stats/libero_norm.json
+13:15:27 | INFO | __main__ | Initializing SmolVLM-VLA from config
+13:15:27 | INFO | __main__ |   smolvlm_model_path: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct
+13:15:27 | INFO | __main__ |   action_mode: libero_joint
+13:15:27 | INFO | __main__ |   num_actions: 10
+13:15:27 | INFO | __main__ |   use_adaln: False
+13:17:03 | INFO | __main__ | Args: Namespace(models=None, output_dir='./runs/simvla_libero_small', smolvlm_model_path='/datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots', train_metas_path='/datasets/simvla/libero_train.json', batch_size=64, image_size=384, learning_rate=0.0001, learning_coef=0.1, weight_decay=0.0, betas=(0.9, 0.95), max_grad_norm=1.0, iters=200000, freeze_steps=1000, warmup_steps=0, use_cosine_decay=False, min_lr_ratio=0.1, save_interval=10000, log_interval=20, seed=0, action_mode='libero_joint', num_workers=4, norm_stats_path='./norm_stats/libero_norm.json', num_actions=10, wandb_project=None, wandb_api_key=None, resume=False, use_adaln=False, hidden_size=768, depth=12, num_heads=12)
+13:17:03 | INFO | __main__ | Using SmolVLM backbone: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots
+13:17:03 | INFO | __main__ | Image size: 384x384
+13:17:03 | INFO | __main__ | Using normalization stats from: ./norm_stats/libero_norm.json
+13:17:03 | INFO | __main__ | Initializing SmolVLM-VLA from config
+13:17:03 | INFO | __main__ |   smolvlm_model_path: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots
+13:17:03 | INFO | __main__ |   action_mode: libero_joint
+13:17:03 | INFO | __main__ |   num_actions: 10
+13:17:03 | INFO | __main__ |   use_adaln: False
+13:18:06 | INFO | __main__ | Args: Namespace(models=None, output_dir='./runs/simvla_libero_small', smolvlm_model_path='/datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots/a7da5b986cb59b408707209984f360a5f4ad7e47', train_metas_path='/datasets/simvla/libero_train.json', batch_size=64, image_size=384, learning_rate=0.0001, learning_coef=0.1, weight_decay=0.0, betas=(0.9, 0.95), max_grad_norm=1.0, iters=200000, freeze_steps=1000, warmup_steps=0, use_cosine_decay=False, min_lr_ratio=0.1, save_interval=10000, log_interval=20, seed=0, action_mode='libero_joint', num_workers=4, norm_stats_path='./norm_stats/libero_norm.json', num_actions=10, wandb_project=None, wandb_api_key=None, resume=False, use_adaln=False, hidden_size=768, depth=12, num_heads=12)
+13:18:06 | INFO | __main__ | Using SmolVLM backbone: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots/a7da5b986cb59b408707209984f360a5f4ad7e47
+13:18:06 | INFO | __main__ | Image size: 384x384
+13:18:06 | INFO | __main__ | Using normalization stats from: ./norm_stats/libero_norm.json
+13:18:06 | INFO | __main__ | Initializing SmolVLM-VLA from config
+13:18:06 | INFO | __main__ |   smolvlm_model_path: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots/a7da5b986cb59b408707209984f360a5f4ad7e47
+13:18:06 | INFO | __main__ |   action_mode: libero_joint
+13:18:06 | INFO | __main__ |   num_actions: 10
+13:18:06 | INFO | __main__ |   use_adaln: False
+13:18:10 | INFO | __main__ | 🚀 Start SmolVLM-VLA training for 200000 iterations
+13:18:10 | INFO | __main__ |    world_size=1

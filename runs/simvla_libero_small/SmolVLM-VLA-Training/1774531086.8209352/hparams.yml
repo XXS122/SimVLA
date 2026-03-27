@@ -1,0 +1,13 @@
+action_mode: libero_joint
+batch_size: 64
+depth: 12
+freeze_steps: 1000
+hidden_size: 768
+image_size: 384
+iters: 200000
+learning_rate: 0.0001
+num_actions: 10
+save_interval: 10000
+smolvlm_model_path: /datasets/models/models--HuggingFaceTB--SmolVLM-500M-Instruct/snapshots/a7da5b986cb59b408707209984f360a5f4ad7e47
+use_adaln: false
+warmup_steps: 0
