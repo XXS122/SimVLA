@@ -1,0 +1,8 @@
+*.log
+.env
+**/temp/
+datasets/
+runs/
+*.pyc
+evaluation/libero/eval_simvla_8102
+models/__pycache__

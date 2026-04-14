@@ -1,0 +1,249 @@
+[robosuite WARNING] No private macro file found! (__init__.py:7)
+[robosuite WARNING] It is recommended to use a private macro file (__init__.py:8)
+[robosuite WARNING] To setup, run: python /opt/conda/envs/libero/lib/python3.8/site-packages/robosuite/scripts/setup_macros.py (__init__.py:9)
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Starting LIBERO evaluation client
+   Client type: websocket
+   Server: ws://127.0.0.1:8102
+   Task suite: libero_object
+   Replan steps: 5
+
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+Task suite: libero_object
+   Tasks: 10, Trials per task: 10
+   Max steps: 800
+Tasks:   0%|          | 0/10 [00:00<?, ?it/s]
+pick up the orange juice and p...:   0%|          | 0/10 [00:00<?, ?it/s][A  [OK] Task 9 Ep 0: SUCCESS (steps=111)
+
+pick up the orange juice and p...:  10%|█         | 1/10 [00:06<01:01,  6.87s/it][A  [OK] Task 9 Ep 1: SUCCESS (steps=102)
+
+pick up the orange juice and p...:  20%|██        | 2/10 [00:13<00:52,  6.60s/it][A  [OK] Task 9 Ep 2: SUCCESS (steps=108)
+
+pick up the orange juice and p...:  30%|███       | 3/10 [00:19<00:46,  6.61s/it][A  [OK] Task 9 Ep 3: SUCCESS (steps=105)
+
+pick up the orange juice and p...:  40%|████      | 4/10 [00:26<00:40,  6.71s/it][A  [OK] Task 9 Ep 4: SUCCESS (steps=115)
+
+pick up the orange juice and p...:  50%|█████     | 5/10 [00:33<00:33,  6.78s/it][A  [OK] Task 9 Ep 5: SUCCESS (steps=109)
+
+pick up the orange juice and p...:  60%|██████    | 6/10 [00:40<00:26,  6.72s/it][A  [OK] Task 9 Ep 6: SUCCESS (steps=111)
+
+pick up the orange juice and p...:  70%|███████   | 7/10 [00:47<00:20,  6.72s/it][A  [OK] Task 9 Ep 7: SUCCESS (steps=108)
+
+pick up the orange juice and p...:  80%|████████  | 8/10 [00:53<00:13,  6.61s/it][A  [FAIL] Task 9 Ep 8: FAILURE (steps=810)
+
+pick up the orange juice and p...:  90%|█████████ | 9/10 [01:33<00:17, 17.08s/it][A  [OK] Task 9 Ep 9: SUCCESS (steps=105)
+
+pick up the orange juice and p...: 100%|██████████| 10/10 [01:39<00:00, 13.80s/it][A
+                                                                                  [A   Task 9: 9/10 (90.0%)
+Tasks:  10%|█         | 1/10 [01:42<15:21, 102.43s/it]
+pick up the chocolate pudding ...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 8 Ep 0: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  10%|█         | 1/10 [00:40<06:05, 40.56s/it][A  [FAIL] Task 8 Ep 1: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  20%|██        | 2/10 [01:21<05:25, 40.71s/it][A  [FAIL] Task 8 Ep 2: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  30%|███       | 3/10 [02:01<04:44, 40.67s/it][A  [FAIL] Task 8 Ep 3: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  40%|████      | 4/10 [02:42<04:04, 40.67s/it][A  [FAIL] Task 8 Ep 4: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  50%|█████     | 5/10 [03:23<03:23, 40.65s/it][A  [FAIL] Task 8 Ep 5: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  60%|██████    | 6/10 [04:03<02:42, 40.55s/it][A  [FAIL] Task 8 Ep 6: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  70%|███████   | 7/10 [04:43<02:01, 40.45s/it][A  [FAIL] Task 8 Ep 7: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  80%|████████  | 8/10 [05:24<01:21, 40.54s/it][A  [FAIL] Task 8 Ep 8: FAILURE (steps=810)
+
+pick up the chocolate pudding ...:  90%|█████████ | 9/10 [06:05<00:40, 40.65s/it][A  [FAIL] Task 8 Ep 9: FAILURE (steps=810)
+
+pick up the chocolate pudding ...: 100%|██████████| 10/10 [06:47<00:00, 41.04s/it][A
+                                                                                  [A   Task 8: 0/10 (0.0%)
+Tasks:  20%|██        | 2/10 [08:31<37:40, 282.52s/it]
+pick up the milk and place it ...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 7 Ep 0: FAILURE (steps=810)
+
+pick up the milk and place it ...:  10%|█         | 1/10 [00:41<06:12, 41.34s/it][A  [FAIL] Task 7 Ep 1: FAILURE (steps=810)
+
+pick up the milk and place it ...:  20%|██        | 2/10 [01:22<05:30, 41.35s/it][A  [FAIL] Task 7 Ep 2: FAILURE (steps=810)
+
+pick up the milk and place it ...:  30%|███       | 3/10 [02:04<04:50, 41.52s/it][A  [FAIL] Task 7 Ep 3: FAILURE (steps=810)
+
+pick up the milk and place it ...:  40%|████      | 4/10 [02:45<04:08, 41.46s/it][A  [FAIL] Task 7 Ep 4: FAILURE (steps=810)
+
+pick up the milk and place it ...:  50%|█████     | 5/10 [03:27<03:28, 41.72s/it][A  [FAIL] Task 7 Ep 5: FAILURE (steps=810)
+
+pick up the milk and place it ...:  60%|██████    | 6/10 [04:09<02:46, 41.53s/it][A  [FAIL] Task 7 Ep 6: FAILURE (steps=810)
+
+pick up the milk and place it ...:  70%|███████   | 7/10 [04:50<02:04, 41.52s/it][A  [FAIL] Task 7 Ep 7: FAILURE (steps=810)
+
+pick up the milk and place it ...:  80%|████████  | 8/10 [05:31<01:22, 41.30s/it][A  [FAIL] Task 7 Ep 8: FAILURE (steps=810)
+
+pick up the milk and place it ...:  90%|█████████ | 9/10 [06:13<00:41, 41.45s/it][A  [FAIL] Task 7 Ep 9: FAILURE (steps=810)
+
+pick up the milk and place it ...: 100%|██████████| 10/10 [06:54<00:00, 41.48s/it][A
+                                                                                  [A   Task 7: 0/10 (0.0%)
+Tasks:  30%|███       | 3/10 [15:27<40:05, 343.65s/it]
+pick up the butter and place i...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 6 Ep 0: FAILURE (steps=810)
+
+pick up the butter and place i...:  10%|█         | 1/10 [00:41<06:11, 41.23s/it][A  [FAIL] Task 6 Ep 1: FAILURE (steps=810)
+
+pick up the butter and place i...:  20%|██        | 2/10 [01:22<05:28, 41.06s/it][A  [FAIL] Task 6 Ep 2: FAILURE (steps=810)
+
+pick up the butter and place i...:  30%|███       | 3/10 [02:03<04:48, 41.18s/it][A  [FAIL] Task 6 Ep 3: FAILURE (steps=810)
+
+pick up the butter and place i...:  40%|████      | 4/10 [02:45<04:09, 41.54s/it][A  [FAIL] Task 6 Ep 4: FAILURE (steps=810)
+
+pick up the butter and place i...:  50%|█████     | 5/10 [03:26<03:26, 41.30s/it][A  [FAIL] Task 6 Ep 5: FAILURE (steps=810)
+
+pick up the butter and place i...:  60%|██████    | 6/10 [04:06<02:43, 40.96s/it][A  [FAIL] Task 6 Ep 6: FAILURE (steps=810)
+
+pick up the butter and place i...:  70%|███████   | 7/10 [04:47<02:02, 40.77s/it][A  [FAIL] Task 6 Ep 7: FAILURE (steps=810)
+
+pick up the butter and place i...:  80%|████████  | 8/10 [05:28<01:21, 40.83s/it][A  [FAIL] Task 6 Ep 8: FAILURE (steps=810)
+
+pick up the butter and place i...:  90%|█████████ | 9/10 [06:08<00:40, 40.64s/it][A  [FAIL] Task 6 Ep 9: FAILURE (steps=810)
+
+pick up the butter and place i...: 100%|██████████| 10/10 [06:49<00:00, 40.78s/it][A
+                                                                                  [A   Task 6: 0/10 (0.0%)
+Tasks:  40%|████      | 4/10 [22:18<37:00, 370.10s/it]
+pick up the tomato sauce and p...:   0%|          | 0/10 [00:00<?, ?it/s][A  [OK] Task 5 Ep 0: SUCCESS (steps=117)
+
+pick up the tomato sauce and p...:  10%|█         | 1/10 [00:06<01:01,  6.81s/it][A  [FAIL] Task 5 Ep 1: FAILURE (steps=810)
+
+pick up the tomato sauce and p...:  20%|██        | 2/10 [00:47<03:32, 26.55s/it][A  [OK] Task 5 Ep 2: SUCCESS (steps=127)
+
+pick up the tomato sauce and p...:  30%|███       | 3/10 [00:54<02:05, 17.96s/it][A  [OK] Task 5 Ep 3: SUCCESS (steps=120)
+
+pick up the tomato sauce and p...:  40%|████      | 4/10 [01:02<01:23, 13.86s/it][A  [OK] Task 5 Ep 4: SUCCESS (steps=127)
+
+pick up the tomato sauce and p...:  50%|█████     | 5/10 [01:10<00:57, 11.58s/it][A  [OK] Task 5 Ep 5: SUCCESS (steps=131)
+
+pick up the tomato sauce and p...:  60%|██████    | 6/10 [01:17<00:41, 10.29s/it][A  [OK] Task 5 Ep 6: SUCCESS (steps=157)
+
+pick up the tomato sauce and p...:  70%|███████   | 7/10 [01:26<00:29,  9.86s/it][A  [OK] Task 5 Ep 7: SUCCESS (steps=121)
+
+pick up the tomato sauce and p...:  80%|████████  | 8/10 [01:34<00:18,  9.04s/it][A  [OK] Task 5 Ep 8: SUCCESS (steps=130)
+
+pick up the tomato sauce and p...:  90%|█████████ | 9/10 [01:41<00:08,  8.69s/it][A  [OK] Task 5 Ep 9: SUCCESS (steps=110)
+
+pick up the tomato sauce and p...: 100%|██████████| 10/10 [01:48<00:00,  8.03s/it][A
+                                                                                  [A   Task 5: 9/10 (90.0%)
+Tasks:  50%|█████     | 5/10 [24:07<23:01, 276.22s/it]
+pick up the ketchup and place ...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 4 Ep 0: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  10%|█         | 1/10 [00:40<06:05, 40.65s/it][A  [FAIL] Task 4 Ep 1: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  20%|██        | 2/10 [01:22<05:33, 41.65s/it][A  [FAIL] Task 4 Ep 2: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  30%|███       | 3/10 [02:04<04:52, 41.75s/it][A  [FAIL] Task 4 Ep 3: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  40%|████      | 4/10 [02:46<04:11, 41.85s/it][A  [FAIL] Task 4 Ep 4: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  50%|█████     | 5/10 [03:29<03:29, 42.00s/it][A  [FAIL] Task 4 Ep 5: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  60%|██████    | 6/10 [04:10<02:47, 41.92s/it][A  [FAIL] Task 4 Ep 6: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  70%|███████   | 7/10 [04:53<02:05, 41.98s/it][A  [FAIL] Task 4 Ep 7: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  80%|████████  | 8/10 [05:33<01:22, 41.44s/it][A  [FAIL] Task 4 Ep 8: FAILURE (steps=810)
+
+pick up the ketchup and place ...:  90%|█████████ | 9/10 [06:13<00:40, 40.96s/it][A  [FAIL] Task 4 Ep 9: FAILURE (steps=810)
+
+pick up the ketchup and place ...: 100%|██████████| 10/10 [06:53<00:00, 40.83s/it][A
+                                                                                  [A   Task 4: 0/10 (0.0%)
+Tasks:  60%|██████    | 6/10 [31:02<21:33, 323.35s/it]
+pick up the bbq sauce and plac...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 3 Ep 0: FAILURE (steps=810)
+
+pick up the bbq sauce and plac...:  10%|█         | 1/10 [00:39<05:55, 39.46s/it][A  [OK] Task 3 Ep 1: SUCCESS (steps=114)
+
+pick up the bbq sauce and plac...:  20%|██        | 2/10 [00:46<02:41, 20.16s/it][A  [OK] Task 3 Ep 2: SUCCESS (steps=125)
+
+pick up the bbq sauce and plac...:  30%|███       | 3/10 [00:53<01:39, 14.28s/it][A  [OK] Task 3 Ep 3: SUCCESS (steps=129)
+
+pick up the bbq sauce and plac...:  40%|████      | 4/10 [01:00<01:09, 11.62s/it][A  [FAIL] Task 3 Ep 4: FAILURE (steps=810)
+
+pick up the bbq sauce and plac...:  50%|█████     | 5/10 [01:41<01:49, 21.92s/it][A  [FAIL] Task 3 Ep 5: FAILURE (steps=810)
+
+pick up the bbq sauce and plac...:  60%|██████    | 6/10 [02:20<01:52, 28.00s/it][A  [OK] Task 3 Ep 6: SUCCESS (steps=127)
+
+pick up the bbq sauce and plac...:  70%|███████   | 7/10 [02:28<01:03, 21.28s/it][A  [OK] Task 3 Ep 7: SUCCESS (steps=152)
+
+pick up the bbq sauce and plac...:  80%|████████  | 8/10 [02:36<00:34, 17.25s/it][A  [OK] Task 3 Ep 8: SUCCESS (steps=120)
+
+pick up the bbq sauce and plac...:  90%|█████████ | 9/10 [02:44<00:14, 14.09s/it][A  [FAIL] Task 3 Ep 9: FAILURE (steps=810)
+
+pick up the bbq sauce and plac...: 100%|██████████| 10/10 [03:24<00:00, 22.07s/it][A
+                                                                                  [A   Task 3: 6/10 (60.0%)
+Tasks:  70%|███████   | 7/10 [34:27<14:14, 284.74s/it]
+pick up the salad dressing and...:   0%|          | 0/10 [00:00<?, ?it/s][A  [OK] Task 2 Ep 0: SUCCESS (steps=123)
+
+pick up the salad dressing and...:  10%|█         | 1/10 [00:07<01:07,  7.52s/it][A  [OK] Task 2 Ep 1: SUCCESS (steps=102)
+
+pick up the salad dressing and...:  20%|██        | 2/10 [00:13<00:55,  6.90s/it][A  [OK] Task 2 Ep 2: SUCCESS (steps=96)
+
+pick up the salad dressing and...:  30%|███       | 3/10 [00:20<00:45,  6.53s/it][A  [OK] Task 2 Ep 3: SUCCESS (steps=104)
+
+pick up the salad dressing and...:  40%|████      | 4/10 [00:26<00:39,  6.56s/it][A  [OK] Task 2 Ep 4: SUCCESS (steps=105)
+
+pick up the salad dressing and...:  50%|█████     | 5/10 [00:33<00:32,  6.55s/it][A  [OK] Task 2 Ep 5: SUCCESS (steps=112)
+
+pick up the salad dressing and...:  60%|██████    | 6/10 [00:39<00:26,  6.63s/it][A  [OK] Task 2 Ep 6: SUCCESS (steps=122)
+
+pick up the salad dressing and...:  70%|███████   | 7/10 [00:47<00:20,  6.92s/it][A  [OK] Task 2 Ep 7: SUCCESS (steps=104)
+
+pick up the salad dressing and...:  80%|████████  | 8/10 [00:53<00:13,  6.73s/it][A  [OK] Task 2 Ep 8: SUCCESS (steps=104)
+
+pick up the salad dressing and...:  90%|█████████ | 9/10 [01:00<00:06,  6.62s/it][A  [OK] Task 2 Ep 9: SUCCESS (steps=106)
+
+pick up the salad dressing and...: 100%|██████████| 10/10 [01:06<00:00,  6.60s/it][A
+                                                                                  [A   Task 2: 10/10 (100.0%)
+Tasks:  80%|████████  | 8/10 [35:35<07:11, 215.70s/it]
+pick up the cream cheese and p...:   0%|          | 0/10 [00:00<?, ?it/s][A  [OK] Task 1 Ep 0: SUCCESS (steps=136)
+
+pick up the cream cheese and p...:  10%|█         | 1/10 [00:07<01:10,  7.80s/it][A  [OK] Task 1 Ep 1: SUCCESS (steps=136)
+
+pick up the cream cheese and p...:  20%|██        | 2/10 [00:15<01:02,  7.79s/it][A  [OK] Task 1 Ep 2: SUCCESS (steps=136)
+
+pick up the cream cheese and p...:  30%|███       | 3/10 [00:23<00:54,  7.81s/it][A  [OK] Task 1 Ep 3: SUCCESS (steps=131)
+
+pick up the cream cheese and p...:  40%|████      | 4/10 [00:31<00:46,  7.75s/it][A  [OK] Task 1 Ep 4: SUCCESS (steps=136)
+
+pick up the cream cheese and p...:  50%|█████     | 5/10 [00:39<00:39,  7.93s/it][A  [OK] Task 1 Ep 5: SUCCESS (steps=195)
+
+pick up the cream cheese and p...:  60%|██████    | 6/10 [00:50<00:36,  9.18s/it][A  [OK] Task 1 Ep 6: SUCCESS (steps=131)
+
+pick up the cream cheese and p...:  70%|███████   | 7/10 [00:59<00:26,  8.85s/it][A  [OK] Task 1 Ep 7: SUCCESS (steps=131)
+
+pick up the cream cheese and p...:  80%|████████  | 8/10 [01:07<00:17,  8.64s/it][A  [OK] Task 1 Ep 8: SUCCESS (steps=165)
+
+pick up the cream cheese and p...:  90%|█████████ | 9/10 [01:17<00:09,  9.07s/it][A  [OK] Task 1 Ep 9: SUCCESS (steps=125)
+
+pick up the cream cheese and p...: 100%|██████████| 10/10 [01:25<00:00,  8.68s/it][A
+                                                                                  [A   Task 1: 10/10 (100.0%)
+Tasks:  90%|█████████ | 9/10 [37:01<02:55, 175.22s/it]
+pick up the alphabet soup and ...:   0%|          | 0/10 [00:00<?, ?it/s][A  [FAIL] Task 0 Ep 0: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  10%|█         | 1/10 [00:43<06:35, 43.90s/it][A  [FAIL] Task 0 Ep 1: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  20%|██        | 2/10 [01:25<05:40, 42.55s/it][A  [FAIL] Task 0 Ep 2: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  30%|███       | 3/10 [02:06<04:52, 41.82s/it][A  [FAIL] Task 0 Ep 3: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  40%|████      | 4/10 [02:48<04:10, 41.74s/it][A  [FAIL] Task 0 Ep 4: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  50%|█████     | 5/10 [03:29<03:27, 41.45s/it][A  [FAIL] Task 0 Ep 5: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  60%|██████    | 6/10 [04:09<02:44, 41.19s/it][A  [FAIL] Task 0 Ep 6: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  70%|███████   | 7/10 [04:50<02:03, 41.18s/it][A  [FAIL] Task 0 Ep 7: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  80%|████████  | 8/10 [05:31<01:22, 41.12s/it][A  [FAIL] Task 0 Ep 8: FAILURE (steps=810)
+
+pick up the alphabet soup and ...:  90%|█████████ | 9/10 [06:12<00:41, 41.05s/it][A  [FAIL] Task 0 Ep 9: FAILURE (steps=810)
+
+pick up the alphabet soup and ...: 100%|██████████| 10/10 [06:53<00:00, 41.01s/it][A
+                                                                                  [A   Task 0: 0/10 (0.0%)
+Tasks: 100%|██████████| 10/10 [43:56<00:00, 249.17s/it]Tasks: 100%|██████████| 10/10 [43:56<00:00, 263.67s/it]
+
+Total success rate: 44/100 (44.0%)

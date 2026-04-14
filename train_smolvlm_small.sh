@@ -38,7 +38,7 @@ NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="/datasets/simvla/libero_train.json"
 
 # SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="/datasets/models/base_model"
+SMOLVLM_MODEL="/datasets/models/smolvlm/SmolVLM-500M-Instruct"
 
 # =============================================================================
 # Training hyperparameters

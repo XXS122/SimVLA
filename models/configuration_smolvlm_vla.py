@@ -29,7 +29,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
     def __init__(
         self,
         # === SmolVLM backbone ===
-        smolvlm_model_path: str = "HuggingFaceTB/SmolVLM-500M-Instruct",
+        smolvlm_model_path: str = "/datasets/models/smolvlm/SmolVLM-500M-Instruct",
         
         # === Transformer head ===
         hidden_size: int = 768,  # Action transformer hidden size

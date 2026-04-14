@@ -86,7 +86,7 @@ def get_args_parser():
 
     # SmolVLM backbone
     parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
+                        default="/datasets/models/smolvlm/SmolVLM-500M-Instruct",
                         help="Path or HF repo for SmolVLM backbone")
     
     # Data

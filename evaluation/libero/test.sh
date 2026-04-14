@@ -25,7 +25,7 @@ GPUS=${4:-"4 5 6 7"}  # Default GPUs: 4 5 6 7
 
 # Parse GPU list
 read -ra GPU_ARRAY <<< "$GPUS"
-if [ ${#GPU_ARRAY[@]} -lt 1 ]; then
+if [ ${#GPU_ARRAY[@]} -lt 4 ]; then
     echo "ERROR: Need at least 4 GPUs, got ${#GPU_ARRAY[@]}"
     echo "   Usage: $0 <port> <num_trials> <output_prefix> \"<gpu1> <gpu2> <gpu3> <gpu4>\""
     exit 1
@@ -71,7 +71,7 @@ CUDA_VISIBLE_DEVICES=$GPU_OBJECT python -u libero_client.py \
     --client_type websocket \
     --task_suite libero_object \
     --num_trials $NUM_TRIALS \
-    --video_out "$OUTPUT_DIR" 2>&1 | tee "${OUTPUT_PREFIX}_object.txt"
+    --video_out "$OUTPUT_DIR" > "${OUTPUT_PREFIX}_object.txt" 2>&1 &
 PID_OBJECT=$!
 echo "   [PID $PID_OBJECT] libero_object (GPU $GPU_OBJECT) -> ${OUTPUT_PREFIX}_object.txt"
 

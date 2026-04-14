@@ -69,7 +69,9 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     model = model.to(device)
     model.eval()
     
-    smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
+    # smolvlm_path = smolvlm_model_path or "/datasets/models/smolvlm/SmolVLM-500M-Instruct"
+    print(smolvlm_model_path)
+    smolvlm_path = smolvlm_model_path
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
     
     if norm_stats_path and os.path.exists(norm_stats_path):
@@ -268,7 +270,7 @@ def main():
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
     parser.add_argument("--smolvlm_model", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
+                        default="/datasets/models/smolvlm/SmolVLM-500M-Instruct",
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
