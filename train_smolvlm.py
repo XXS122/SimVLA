@@ -86,7 +86,7 @@ def get_args_parser():
 
     # SmolVLM backbone
     parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="/datasets/models/smolvlm/SmolVLM-500M-Instruct",
+                        default="/data/kcl/zz/hyj/model/smolvla",
                         help="Path or HF repo for SmolVLM backbone")
     
     # Data
@@ -145,6 +145,24 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
+
+    # CVAE 子目标潜变量
+    parser.add_argument("--use_subgoal_vae", action="store_true", default=False,
+                        help="启用 CVAE 子目标潜变量（需配合 --use_adaln）")
+    parser.add_argument("--subgoal_latent_dim", type=int, default=64,
+                        help="子目标潜变量维度")
+    parser.add_argument("--kl_weight", type=float, default=0.001,
+                        help="KL 散度损失权重（最终值）")
+    parser.add_argument("--kl_warmup_steps", type=int, default=10000,
+                        help="KL annealing 步数：前 N 步线性增加 kl_weight")
+
+    # Latent Diffusion Model（z 空间 Flow Matching）
+    parser.add_argument("--use_latent_flow", action="store_true", default=False,
+                        help="启用 z 空间 LDM（LatentFlowNet），替换 CVAE 先验采样（需配合 --use_subgoal_vae）")
+    parser.add_argument("--latent_flow_steps", type=int, default=5,
+                        help="推理时 z 空间 Euler 积分步数")
+    parser.add_argument("--latent_fm_weight", type=float, default=1.0,
+                        help="latent FM 损失权重")
     
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
@@ -341,6 +359,12 @@ def main(args):
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
             image_size=args.image_size,
+            use_subgoal_vae=args.use_subgoal_vae,
+            subgoal_latent_dim=args.subgoal_latent_dim,
+            kl_weight=args.kl_weight,
+            use_latent_flow=args.use_latent_flow,
+            latent_flow_steps=args.latent_flow_steps,
+            latent_fm_weight=args.latent_fm_weight,
         )
         model = SmolVLMVLA(config)
         
@@ -401,6 +425,12 @@ def main(args):
 
         # Forward
         loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+
+        # KL annealing：前 kl_warmup_steps 步线性增加 kl_weight
+        if "kl_loss" in loss_dict and args.kl_warmup_steps > 0:
+            kl_scale = min(1.0, global_step / args.kl_warmup_steps)
+            loss_dict["kl_loss"] = loss_dict["kl_loss"] * kl_scale
+
         loss = sum(loss_dict.values())
         
         # Backward
@@ -420,13 +450,25 @@ def main(args):
             if accelerator.is_main_process:
                 dt = (time.time() - t0) / args.log_interval
                 t0 = time.time()
-                logger.info(
+                # 基础日志
+                log_str = (
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
+                    f"v_loss={logs.get('velocity_loss', logs['loss_total']):.4f} "
+                )
+                # 有 kl_loss 时额外打印
+                if "kl_loss" in logs:
+                    log_str += f"kl_loss={logs['kl_loss']:.4f} "
+                # 有 latent_fm_loss 时额外打印
+                if "latent_fm_loss" in logs:
+                    log_str += f"z_fm_loss={logs['latent_fm_loss']:.4f} "
+                log_str += (
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
-                    f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
+                    f"lr_vlm={logs['lr_vlm']:.2e} "
+                    f"({dt:.2f}s/it)"
                 )
+                logger.info(log_str)
         
         # Checkpointing
         global_step += 1

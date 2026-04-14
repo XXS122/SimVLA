@@ -49,7 +49,7 @@ class SmolVLMVLAProcessor:
         self, 
         image_processor=None, 
         tokenizer=None,
-        smolvlm_model_path: str = "/datasets/models/smolvlm/SmolVLM-500M-Instruct",
+        smolvlm_model_path: str = "/data/kcl/zz/hyj/model/smolvla",
     ):
         """
         Initialize SmolVLMVLAProcessor.
@@ -113,7 +113,7 @@ class SmolVLMVLAProcessor:
         except Exception as e:
             print(f"Warning: Could not load from {smolvlm_path}: {e}")
             print("Using default SmolVLM-500M-Instruct")
-            return cls(smolvlm_model_path="/datasets/models/smolvlm/SmolVLM-500M-Instruct")
+            return cls(smolvlm_model_path="/data/kcl/zz/hyj/model/smolvla")
 
     # ================== LANGUAGE ENCODING ==================
     def encode_language(self, language_instruction: Union[str, List[str]]) -> Dict[str, torch.Tensor]:

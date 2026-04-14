@@ -84,7 +84,16 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
-        
+
+        # CVAE 子目标潜变量设置
+        self.use_subgoal_vae = getattr(config, 'use_subgoal_vae', False)
+        self.kl_weight = getattr(config, 'kl_weight', 0.001)
+
+        # Latent Diffusion Model 设置
+        self.use_latent_flow = getattr(config, 'use_latent_flow', True)
+        self.latent_flow_steps = getattr(config, 'latent_flow_steps', 5)
+        self.latent_fm_weight = getattr(config, 'latent_fm_weight', 1.0)
+
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
@@ -97,12 +106,19 @@ class SmolVLMVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
+            use_subgoal_vae=self.use_subgoal_vae,
+            subgoal_latent_dim=getattr(config, 'subgoal_latent_dim', 64),
+            num_actions=config.num_actions,
         )
-        
+
         if self.use_adaln:
             logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
         else:
             logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
+
+        if self.use_subgoal_vae:
+            mode = "LDM (LatentFlowNet)" if self.use_latent_flow else "CVAE prior sampling"
+            logging.info(f"✓ SubgoalVAE enabled: z_goal via {mode}")
 
         # Deferred FastAPI app
         self.app: FastAPI | None = None
@@ -370,18 +386,55 @@ class SmolVLMVLA(PreTrainedModel):
         x_t = t_expanded * noise + (1 - t_expanded) * action_norm
         u_t = noise - action_norm
 
+        # CVAE 子目标潜变量（仅 AdaLN 模式 + use_subgoal_vae 时启用）
+        z_goal = None
+        kl_loss = None
+        latent_fm_loss = None
+        if self.use_subgoal_vae and self.use_adaln:
+            # detach 防止 freeze_steps 内 VAE 梯度干扰 VLM
+            vlm_pooled = enc["vlm_features"].mean(dim=1).detach()
+            post_mu, post_log_var = self.transformer.subgoal_vae.encode_posterior(
+                vlm_pooled, action_norm
+            )
+            prior_mu, prior_log_var = self.transformer.subgoal_vae.encode_prior(vlm_pooled)
+            # z_0：后验采样，作为 LDM 的目标终点
+            z_0 = self.transformer.subgoal_vae.reparameterize(post_mu, post_log_var)
+            kl_loss = self.transformer.subgoal_vae.kl_loss(
+                post_mu, post_log_var, prior_mu, prior_log_var
+            )
+
+            # z 空间 Flow Matching 损失（LDM）
+            if self.use_latent_flow:
+                z_noise = torch.randn_like(z_0)
+                t_z = beta_dist.sample((B,)) * 0.999 + 0.001
+                t_z_exp = t_z.view(-1, 1)
+                z_t_latent = t_z_exp * z_noise + (1 - t_z_exp) * z_0
+                u_z = z_noise - z_0
+                v_z = self.transformer.latent_flow_net(z_t_latent, t_z, vlm_pooled)
+                latent_fm_loss = torch.mean(torch.square(v_z - u_z))
+
+            # 训练时直接用后验 z_0 注入 AdaLN（不走推理积分路径）
+            z_goal = z_0
+
         # Model prediction (no aux_visual_inputs for SmolVLM)
         v_t = self.transformer(
             vlm_features=enc["vlm_features"],
             action_with_noise=x_t,
             t=t,
             proprio=proprio_norm,
+            z_goal=z_goal,
         )
-        
+
         # MSE loss
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
-        return {"velocity_loss": velocity_loss}
+
+        loss_dict = {"velocity_loss": velocity_loss}
+        if kl_loss is not None:
+            loss_dict["kl_loss"] = kl_loss * self.kl_weight
+        if latent_fm_loss is not None:
+            loss_dict["latent_fm_loss"] = latent_fm_loss * self.latent_fm_weight
+
+        return loss_dict
 
     # ================================= inference =================================
     @torch.no_grad()
@@ -421,23 +474,45 @@ class SmolVLMVLA(PreTrainedModel):
         # Euler integration
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+
+        # 推理时生成 z_goal（固定，不随动作 Euler 步变化）
+        z_goal = None
+        if self.use_subgoal_vae and self.use_adaln:
+            vlm_pooled = enc["vlm_features"].mean(dim=1)
+            if self.use_latent_flow:
+                # LDM：从噪声 z_T 积分到 z_0（5步 Euler）
+                latent_dim = self.transformer.subgoal_vae.latent_dim
+                z_t_latent = torch.randn(B, latent_dim, device=device, dtype=dtype)
+                dt_z = -1.0 / self.latent_flow_steps
+                t_z = 1.0
+                while t_z > -dt_z / 2:
+                    t_z_tensor = torch.full((B,), t_z, device=device, dtype=dtype)
+                    v_z = self.transformer.latent_flow_net(z_t_latent, t_z_tensor, vlm_pooled)
+                    z_t_latent = z_t_latent + dt_z * v_z
+                    t_z += dt_z
+                z_goal = z_t_latent
+            else:
+                # 退回简单先验采样
+                prior_mu, prior_log_var = self.transformer.subgoal_vae.encode_prior(vlm_pooled)
+                z_goal = self.transformer.subgoal_vae.reparameterize(prior_mu, prior_log_var)
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
+
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
+                z_goal=z_goal,
             )
-        
+
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
 
     # =============================== FastAPI service =============================

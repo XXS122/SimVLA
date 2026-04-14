@@ -29,7 +29,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
     def __init__(
         self,
         # === SmolVLM backbone ===
-        smolvlm_model_path: str = "/datasets/models/smolvlm/SmolVLM-500M-Instruct",
+        smolvlm_model_path: str = "/data/kcl/zz/hyj/model/smolvla",
         
         # === Transformer head ===
         hidden_size: int = 768,  # Action transformer hidden size
@@ -46,10 +46,20 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
-        
+
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views
+
+        # === CVAE 子目标潜变量 ===
+        use_subgoal_vae: bool = False,
+        subgoal_latent_dim: int = 64,
+        kl_weight: float = 0.001,
+
+        # === Latent Diffusion Model（z 空间 Flow Matching）===
+        use_latent_flow: bool = True,    # 是否用 LDM 替换先验采样（配合 use_subgoal_vae）
+        latent_flow_steps: int = 5,      # 推理时 z 空间 Euler 积分步数
+        latent_fm_weight: float = 1.0,   # latent FM 损失权重
 
         **kwargs,
     ):
@@ -71,10 +81,20 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
-        
+
         # Image settings
         self.image_size = image_size
         self.num_views = num_views
+
+        # CVAE 子目标潜变量设置
+        self.use_subgoal_vae = use_subgoal_vae
+        self.subgoal_latent_dim = subgoal_latent_dim
+        self.kl_weight = kl_weight
+
+        # Latent Diffusion Model 设置
+        self.use_latent_flow = use_latent_flow
+        self.latent_flow_steps = latent_flow_steps
+        self.latent_fm_weight = latent_fm_weight
 
         # Initialize base HF config attributes
         super().__init__(**kwargs)

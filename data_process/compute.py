@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import os
 
 # 1. 离线模型加载
-model_path = "/datasets/models/smolvlm/SmolVLM-500M-Instruct"
+model_path = "/data/kcl/zz/hyj/model/smolvla"
 processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
 model = AutoModel.from_pretrained(
     model_path, 

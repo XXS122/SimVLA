@@ -272,6 +272,26 @@ class LiberoJointActionSpace(BaseActionSpace):
 
 
 # =============================================================================
+# VLABench Action Space
+# =============================================================================
+@register_action("vlabench_joint")
+class VLABenchJointActionSpace(LiberoJointActionSpace):
+    """
+    VLABench 动作空间。
+
+    数据布局：
+      - state (proprio): 7维 [xyz(3) + axis_angle(3) + gripper(1)]
+      - actions: 7维 [xyz(3) + axis_angle(3) + gripper(1)]
+
+    与 LiberoJointActionSpace 逻辑相同，仅 dim_proprio 不同。
+    """
+
+    dim_action = 7
+    dim_proprio = 7
+    gripper_idx = (6,)
+
+
+# =============================================================================
 # Exports
 # =============================================================================
 __all__ = [
@@ -279,6 +299,7 @@ __all__ = [
     "build_action_space",
     "register_action",
     "LiberoJointActionSpace",
+    "VLABenchJointActionSpace",
     "ACTION_REGISTRY",
     "NormStats",
     "load_norm_stats",

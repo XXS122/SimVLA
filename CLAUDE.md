@@ -1,10 +1,14 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Claude Code 在此仓库中工作时提供指导。
 
-## Commands
+## 语言要求
 
-### Environment Setup
+**重要：所有回答、解释、代码注释均必须使用中文。**
+
+## 命令
+
+### 环境配置
 ```bash
 conda create -n simvla python=3.10 -y && conda activate simvla
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
@@ -14,44 +18,62 @@ pip install flash-attn==2.5.6 --no-build-isolation
 pip install tensorflow tensorflow-datasets
 ```
 
-### Data Preparation (LIBERO)
+### 数据准备（LIBERO）
 ```bash
-# 1. Generate dataset metadata JSON
+# 1. 生成数据集元数据 JSON
 python create_libero_meta.py \
     --data_dir ./datasets/metas \
     --subsets libero_10 libero_goal libero_object libero_spatial \
     --output ./datasets/metas/libero_train.json
 
-# 2. Compute action/state normalization statistics
+# 2. 计算动作/状态归一化统计量
 python compute_libero_norm_stats.py \
     --data_dir ./datasets/metas \
     --subsets libero_10 libero_goal libero_object libero_spatial \
     --output ./norm_stats/libero_norm.json
 ```
 
-### Training
+### 数据准备（VLABench）
 ```bash
-# Small model (768 hidden, 12 layers, 12 heads) - single GPU
-bash train_smolvlm_small.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+# 数据位置：/data/kcl/zz/hyj/vlabench/data/1.0.0（RLDS TFRecord 格式，512个shard）
 
-# Large model (1024 hidden, 24 layers, 16 heads) - 4 GPUs
-bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+# 1. 生成数据集元数据 JSON
+python create_vlabench_meta.py \
+    --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \
+    --output ./datasets/metas/vlabench_train.json
 
-# Direct invocation
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-accelerate launch --num_processes=1 --mixed_precision bf16 \
-    train_smolvlm.py \
-    --train_metas_path ./datasets/metas/libero_train.json \
-    --smolvlm_model_path /path/to/SmolVLM-500M-Instruct \
-    --action_mode libero_joint \
-    --norm_stats_path ./norm_stats/libero_norm.json \
-    --output_dir ./runs/my_run
+# 2. 计算动作/状态归一化统计量
+python compute_vlabench_norm_stats.py \
+    --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \
+    --output ./norm_stats/vlabench_norm.json
+# 可加 --max_shards 50 用部分数据加速估算
 ```
 
-### Evaluation (LIBERO - WebSocket server)
+### 训练
+```bash
+# 小模型（隐藏层768，12层，12头）- LIBERO，双 GPU
+bash train_smolvlm_small.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+
+# 大模型（隐藏层1024，24层，16头）- 4 GPU
+bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+
+# VLABench 基础训练（AdaLN 关闭，自动完成 meta 生成和 norm stats 计算）
+bash train_smolvlm_vlabench.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+
+# VLABench + CVAE 子目标潜变量训练（AdaLN + SubgoalVAE，双 GPU A800）
+bash train_smolvlm_subgoal.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+# 示例：
+bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal
+# 从断点续训：
+bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal ./simvla_output/simvla_subgoal/ckpt-10000
+```
+
+所有训练脚本均使用 `CUDA_VISIBLE_DEVICES=6,7`（双卡 A800 80G），`--num_processes=2` DDP，`bf16` 混合精度。
+
+### 评估（LIBERO - WebSocket 服务器）
 ```bash
 cd evaluation/libero
-# Start inference server
+# 启动推理服务器
 python serve_smolvlm_libero.py \
     --checkpoint /path/to/checkpoint \
     --norm_stats /path/to/libero_norm.json \
@@ -59,63 +81,185 @@ python serve_smolvlm_libero.py \
     --port 8000
 ```
 
-Key training args: `--use_adaln` (DiT-style conditioning), `--image_size 384|512`, `--num_actions 10`, `--freeze_steps 1000` (VLM frozen for first N steps), `--learning_coef 0.1` (VLM LR multiplier).
+### 评估（VLABench）
 
-## Architecture
+VLABench 评估需要两个环境：
+- **simvla 环境**：运行推理服务器
+- **vlabench 环境**：运行评估客户端
 
-SimVLA is a Vision-Language-Action (VLA) model for robot manipulation. It has two main components: a frozen/fine-tuned VLM backbone and a Flow Matching action head.
+#### 1. 准备 VLABench 环境
+```bash
+# 创建 vlabench 环境
+conda create -n vlabench python=3.10 -y && conda activate vlabench
+pip install dm_control==1.0.22 mujoco==3.2.6
+pip install numpy scipy pillow matplotlib
+pip install tensorflow tensorflow-datasets
+pip install websockets msgpack-numpy
 
-### Data Flow
+# 安装 EGL 渲染支持（headless 服务器必需）
+apt-get update && apt-get install -y libegl1 libgl1-mesa-glx libglib2.0-0
+
+# 下载 VLABench 资源文件（需手动从 Google Drive 下载并解压）
+# obj.zip: https://drive.google.com/file/d/1ldEMZua2OzXHJTYTCP0IGVU1aFYBCMu-/view
+# scene.zip: https://drive.google.com/file/d/1KdReRkibJClBHHD32jz_wTkaBzhEJ9Kw/view
+# 解压到 /data/kcl/zz/hyj/code/VLABench/VLABench/assets/
 ```
-HDF5 file → LiberoHDF5Handler.iter_episode()
-  ├─ obs: agentview_rgb[T,128,128,3], eye_in_hand_rgb[T,128,128,3]
-  ├─ proprio: ee_pos(3) + euler→axis_angle(3) + gripper(2) = 8-dim
-  └─ actions: delta_xyz(3) + delta_euler(3) + gripper(1) = 7-dim
-       ↓ image_aug (resize→384, ColorJitter, ImageNet normalize)
+
+#### 2. 生成 track_5_long_horizon 测试集
+```bash
+conda activate vlabench
+cd /data/kcl/zz/hyj/code/VLABench
+VLABENCH_ROOT=/data/kcl/zz/hyj/code/VLABench/VLABench MUJOCO_GL=egl \
+python generate_track5_long_horizon.py --n-episodes 50
+
+# 输出：VLABench/configs/evaluation/tracks/track_5_long_horizon.json
+# 包含 7 个长期任务，每任务 50 个 episode，共 350 个测试样本
+```
+
+**VLABench 测试集统计**：
+| Track | 任务数 | 每任务 episode | 总 episode |
+|---|---|---|---|
+| track_1_in_distribution | 10 | 50 | 500 |
+| track_2_cross_category | 10 | 50（部分10） | 460 |
+| track_3_common_sense | 10 | 50 | 500 |
+| track_4_semantic_instruction | 10 | 50 | 500 |
+| track_5_long_horizon | 7 | 50 | 350 |
+| track_6_unseen_texture | 10 | 50 | 500 |
+
+#### 3. 启动推理服务器（simvla 环境）
+```bash
+conda activate simvla
+cd /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench
+
+CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
+    --checkpoint /data/kcl/zz/hyj/code/SimVLA/simvla_output/simvla_vlabench_small/ckpt-10000 \
+    --norm_stats ../../norm_stats/vlabench_norm.json \
+    --smolvlm_model /data/kcl/zz/hyj/model/smolvla \
+    --port 8001
+
+# 服务器监听 0.0.0.0:8001，使用 WebSocket + msgpack 协议
+# 与 VLABench 的 OpenPiPolicy 客户端完全兼容
+```
+
+#### 4. 运行评估（vlabench 环境，另开终端）
+```bash
+conda activate vlabench
+cd /data/kcl/zz/hyj/code/VLABench
+
+python /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
+    --eval-track track_5_long_horizon \
+    --n-episode 10 \
+    --port 8001 \
+    --save-dir /data/kcl/zz/hyj/code/SimVLA/simvla_output/eval_results
+
+# 支持的 track：
+#   track_1_in_distribution, track_2_cross_category, track_3_common_sense,
+#   track_4_semantic_instruction, track_5_long_horizon, track_6_unseen_texture
+
+# 可选参数：
+#   --replan-steps 4        # 每隔多少步重新推理动作 chunk
+#   --metrics success_rate  # 评估指标（success_rate, intention_score, progress_score）
+#   --visualization         # 保存可视化视频
+```
+
+#### 5. 查看结果
+```bash
+# 结果保存在：
+# /datasets/simvla_output/eval_results/track_5_long_horizon/simvla/evaluation_result.json
+
+cat /datasets/simvla_output/eval_results/track_5_long_horizon/simvla/evaluation_result.json
+```
+
+关键训练参数：`--use_adaln`（DiT 风格条件注入）、`--image_size 384|512`、`--num_actions 10`、`--freeze_steps 1000`（前 N 步冻结 VLM）、`--learning_coef 0.1`（VLM 学习率倍率）。
+
+CVAE 子目标参数：`--use_subgoal_vae`（启用，需配合 `--use_adaln`）、`--subgoal_latent_dim 64`（潜变量维度）、`--kl_weight 0.001`（KL 权重上限）、`--kl_warmup_steps 10000`（KL annealing 步数）。
+
+LDM 参数：`--use_latent_flow`（启用 z 空间 Flow Matching，需配合 `--use_subgoal_vae`）、`--latent_flow_steps 5`（推理时 z 空间 Euler 积分步数）、`--latent_fm_weight 1.0`（z 空间 FM 损失权重）。
+
+## 架构
+
+SimVLA 是用于机器人操作的视觉-语言-动作（VLA）模型，由两个主要组件构成：冻结/微调的 VLM 骨干网络和 Flow Matching 动作头。
+
+### 数据流
+```
+HDF5 文件 → LiberoHDF5Handler.iter_episode()
+  ├─ 观测: agentview_rgb[T,128,128,3], eye_in_hand_rgb[T,128,128,3]
+  ├─ 本体感知: ee_pos(3) + euler→axis_angle(3) + gripper(2) = 8维
+  └─ 动作: delta_xyz(3) + delta_euler(3) + gripper(1) = 7维
+       ↓ 图像增强（resize→384, ColorJitter, ImageNet 归一化）
 SmolVLMDataReader → DataLoader → batch
        ↓ processor.encode_language() → input_ids
 SmolVLMVLA.forward()
-  ├─ forward_vlm_efficient(): SigLIP → connector → concat text_embeds → LM → vlm_features[B, seq, 576]
-  ├─ Flow Matching: t~Beta(1.5,1), x_t = t*noise + (1-t)*action_norm, target u_t = noise - action
+  ├─ forward_vlm_efficient(): SigLIP → connector → 拼接 text_embeds → LM → vlm_features[B, seq, 576]
+  ├─ Flow Matching: t~Beta(1.5,1), x_t = t*noise + (1-t)*action_norm, 目标 u_t = noise - action
   └─ SmolVLMActionTransformer → MSE(v_t, u_t)
 ```
 
-### Module Map
+### 模块说明
 
-| File | Role |
+| 文件 | 作用 |
 |---|---|
-| `models/modeling_smolvlm_vla.py` | Top-level `SmolVLMVLA(PreTrainedModel)` — VLM forward, Flow Matching training loop, Euler inference, FastAPI service |
-| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — two modes: Concat (`TransformerBlock`) or AdaLN/DiT (`DiTBlock`). Also `timestep_embedding`, `FinalLayer` |
-| `models/action_hub.py` | `LiberoJointActionSpace` — action/state normalization (z-score or quantile). Registry pattern via `@register_action`. |
-| `models/configuration_smolvlm_vla.py` | HuggingFace `PretrainedConfig` subclass, serialized with `save_pretrained` |
-| `models/processing_smolvlm_vla.py` | `SmolVLMVLAProcessor` — wraps SmolVLM processor for `encode_language()` at training time |
-| `datasets/dataset_smolvlm.py` | `SmolVLMDataReader(IterableDataset)` — infinite weighted multi-dataset sampler |
-| `datasets/domain_handler/registry.py` | Dict mapping `dataset_name → HandlerClass`. **Edit here to add new datasets.** |
-| `datasets/domain_handler/libero_hdf5.py` | `LiberoHDF5Handler(DomainHandler)` — reads LIBERO HDF5 format |
-| `datasets/domain_handler/base.py` | Abstract `DomainHandler` + `BaseHDF5Handler` with interpolation-based trajectory sampling |
-| `datasets/domain_config.py` | `DATA_WEIGHTS` dict for multi-dataset sampling ratios |
-| `datasets/utils.py` | `action_slice()`, `read_parquet()`, `decode_image_from_bytes()`, rotation converters |
-| `train_smolvlm.py` | Training loop using `accelerate`. Three optimizer param groups: `vlm` (frozen first N steps), `transformer_core`, `action_heads` |
-| `evaluation/libero/serve_smolvlm_libero.py` | WebSocket inference server (msgpack_numpy serialization) |
+| `models/modeling_smolvlm_vla.py` | 顶层 `SmolVLMVLA(PreTrainedModel)` — VLM 前向传播、Flow Matching 训练循环、Euler 推理、FastAPI 服务 |
+| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — 两种模式：Concat（`TransformerBlock`）或 AdaLN/DiT（`DiTBlock`）。包含 `timestep_embedding`、`FinalLayer`、`SubgoalVAE`、`LatentFlowNet` |
+| `models/action_hub.py` | `LiberoJointActionSpace`、`VLABenchJointActionSpace` — 动作/状态归一化（z-score 或分位数）。通过 `@register_action` 注册 |
+| `models/configuration_smolvlm_vla.py` | HuggingFace `PretrainedConfig` 子类，通过 `save_pretrained` 序列化。含 CVAE 和 LDM 配置字段 |
+| `models/processing_smolvlm_vla.py` | `SmolVLMVLAProcessor` — 封装 SmolVLM processor，训练时调用 `encode_language()` |
+| `datasets/dataset_smolvlm.py` | `SmolVLMDataReader(IterableDataset)` — 无限加权多数据集采样器 |
+| `datasets/domain_handler/registry.py` | `dataset_name → HandlerClass` 映射字典。**添加新数据集时在此修改。** |
+| `datasets/domain_handler/libero_hdf5.py` | `LiberoHDF5Handler(DomainHandler)` — 读取 LIBERO HDF5 格式 |
+| `datasets/domain_handler/vlabench_rlds.py` | `VLABenchRLDSHandler(DomainHandler)` — 读取 VLABench RLDS TFRecord 格式 |
+| `datasets/domain_handler/base.py` | 抽象类 `DomainHandler` + `BaseHDF5Handler`，支持基于插值的轨迹采样 |
+| `datasets/domain_config.py` | 多数据集采样比例 `DATA_WEIGHTS` 字典 |
+| `datasets/utils.py` | `action_slice()`、`read_parquet()`、`decode_image_from_bytes()`、旋转转换工具 |
+| `train_smolvlm.py` | 使用 `accelerate` 的训练循环。三个优化器参数组：`vlm`（前 N 步冻结）、`transformer_core`、`action_heads` |
+| `train_smolvlm_vlabench.sh` | VLABench 基础训练入口脚本，自动完成 meta 生成和 norm stats 计算 |
+| `train_smolvlm_subgoal.sh` | VLABench + CVAE 子目标潜变量训练脚本（AdaLN + SubgoalVAE，双卡 A800） |
+| `create_vlabench_meta.py` | 生成 VLABench 训练元数据 JSON（扫描 TFRecord shard 列表） |
+| `compute_vlabench_norm_stats.py` | 计算 VLABench 动作/状态归一化统计量，复用 `RunningStats`，输出格式与 LIBERO 一致 |
+| `/data/kcl/zz/hyj/code/VLABench/generate_track5_long_horizon.py` | 生成 track_5_long_horizon.json（7个长期任务，每任务50 episode），在 vlabench 环境下运行 |
+| `evaluation/libero/serve_smolvlm_libero.py` | LIBERO WebSocket 推理服务器（msgpack_numpy 序列化） |
+| `evaluation/vlabench/serve_smolvlm_vlabench.py` | VLABench WebSocket 推理服务器，含 quat→axis_angle 状态转换 |
+| `evaluation/vlabench/evaluate_simvla.py` | VLABench 评估客户端，复用 OpenPiPolicy 协议，支持全部6个 track |
 
-### Action Transformer Modes
+### 动作 Transformer 模式
 
-**Concat mode** (default, `use_adaln=False`): action tokens + time + proprio are concatenated, then VLM features are appended to sequence: `x = cat([action_tokens, vlm_proj(vlm_features)], dim=1)`. Only action positions are decoded.
+**Concat 模式**（默认，`use_adaln=False`）：动作 token + 时间步 + 本体感知拼接后，将 VLM 特征追加到序列末尾：`x = cat([action_tokens, vlm_proj(vlm_features)], dim=1)`，仅解码动作位置。
 
-**AdaLN/DiT mode** (`--use_adaln`): condition `c = time_emb + vlm_pool + proprio_emb` injected into each `DiTBlock` via adaptive layer norm. Cleaner separation of conditioning signal.
+**AdaLN/DiT 模式**（`--use_adaln`）：条件 `c = time_emb + vlm_pool + proprio_emb` 通过自适应层归一化注入每个 `DiTBlock`，条件信号与主序列分离更清晰。
 
-### Adding a New Dataset
+**CVAE 子目标模式**（`--use_adaln --use_subgoal_vae`）：在 AdaLN 条件中额外注入子目标潜变量 `z_goal ∈ R^64`。训练时从后验 `q(z | vlm, action)` 采样，推理时从先验 `p(z | vlm)` 采样。条件变为 `c = time_emb + vlm_pool + proprio_emb + subgoal_proj(z_goal)`，使模型能表示子任务的多模态分布，对长程任务阶段切换更鲁棒。
 
-1. Create `datasets/domain_handler/mydata.py` implementing `DomainHandler.iter_episode()` — must yield dicts with keys: `language_instruction`, `image_input[V,C,H,W]`, `image_mask[V]`, `abs_trajectory[T+1,D]` (state at [0], actions at [1:])
-2. Register in `datasets/domain_handler/registry.py`: add `"mydata_name": MyHandler` to `_REGISTRY`
-3. Add sampling weight in `datasets/domain_config.py`
-4. If action space differs, add a new `@register_action("mydata_joint")` class in `models/action_hub.py`
-5. Create meta JSON with fields: `dataset_name`, `datalist` (list of `{path, task}`), `data_dir`
+**层次化双扩散模式**（`--use_adaln --use_subgoal_vae --use_latent_flow`）：在 CVAE 基础上，用 `LatentFlowNet` 在 z 空间（64维）做 Flow Matching，替换简单高斯先验采样。推理时先用 5 步 Euler 积分从噪声生成 `z_goal`，再用 10 步 Euler 积分生成动作序列，形成两层嵌套扩散结构（z 空间子目标层 + 动作空间执行层）。详见 `docs/subgoal_vae_design.md`。
 
-### Key Design Decisions
+### 添加新数据集
 
-- **No aux_visual_inputs**: Unlike FlorenceVLA, all camera views go through SmolVLM directly. The VLM processes `[image1_patches, image2_patches, ..., text_tokens]` as a single sequence.
-- **Flow Matching, not DDPM**: Uses linear interpolation ODE with Beta(1.5,1) time distribution and Euler integration at inference (10 steps by default).
-- **Lazy VLM unfreeze**: VLM parameters have `lr=0` for the first `freeze_steps` iterations, then are unfrozen at `learning_rate * learning_coef`.
-- **`abs_trajectory` convention**: Handlers yield `[T+1, D]` where index 0 is the current state (proprio) and indices 1..T are future actions. `action_slice()` separates these and optionally computes deltas.
-- `datasets/utils.py` already contains `read_parquet()` for Parquet support — the infrastructure for non-HDF5 formats is partially in place.
+1. 创建 `datasets/domain_handler/mydata.py`，实现 `DomainHandler.iter_episode()` — 必须 yield 包含以下键的字典：`language_instruction`、`image_input[V,C,H,W]`、`image_mask[V]`、`abs_trajectory[T+1,D]`（索引0为当前状态，1:为未来动作）
+2. 在 `datasets/domain_handler/registry.py` 注册：将 `"mydata_name": MyHandler` 添加到 `_REGISTRY`
+3. 在 `datasets/domain_config.py` 添加采样权重
+4. 若动作空间不同，在 `models/action_hub.py` 添加新的 `@register_action("mydata_joint")` 类
+5. 创建元数据 JSON，包含字段：`dataset_name`、`datalist`（`{path, task}` 列表）、`data_dir`
+
+### 关键设计决策
+
+- **无 aux_visual_inputs**：与 FlorenceVLA 不同，所有摄像头视角直接通过 SmolVLM 处理。VLM 将 `[image1_patches, image2_patches, ..., text_tokens]` 作为单一序列处理。
+- **Flow Matching 而非 DDPM**：使用线性插值 ODE，时间分布为 Beta(1.5,1)，推理时采用 Euler 积分（默认10步）。
+- **延迟 VLM 解冻**：VLM 参数在前 `freeze_steps` 步 `lr=0`，之后以 `learning_rate * learning_coef` 解冻。
+- **`abs_trajectory` 约定**：Handler yield `[T+1, D]`，索引0为当前状态（本体感知），索引1..T为未来动作。`action_slice()` 负责分离并可选计算增量。
+- `datasets/utils.py` 已包含 `read_parquet()` 支持 Parquet 格式 — 非 HDF5 格式的基础设施已部分就绪。
+- **CVAE 子目标潜变量**：`SubgoalVAE` 位于 `models/transformer_smolvlm.py`。训练时后验 encoder 接收 `vlm_pooled + action_chunk`，推理时先验 encoder 仅接收 `vlm_pooled`。使用 Free Bits（每维 KL ≥ 0.5）防止 KL 崩溃，KL annealing 前 `kl_warmup_steps` 步线性增加权重。`vlm_pooled` 在 `freeze_steps` 内 `.detach()` 防止梯度干扰 VLM。
+- **Latent Diffusion Model（LDM）**：`LatentFlowNet` 位于 `models/transformer_smolvlm.py`，在 64 维 z 空间做 Flow Matching，以 `vlm_pooled` 为条件。训练时计算 z 空间速度场损失 `L_latent_fm = MSE(v_z, u_z)`；推理时用 5 步 Euler 积分从噪声生成 `z_goal`，替换简单高斯先验采样。输出层初始化为零，训练初期不干扰 CVAE 收敛。总损失：`L = L_velocity + λ_kl · L_KL + λ_fm · L_latent_fm`。
+
+### VLABench 数据集说明
+
+数据位置：`/data/kcl/zz/hyj/vlabench/data/1.0.0`，RLDS TFRecord 格式，512个 shard。
+
+| 字段 | 说明 |
+|---|---|
+| `steps/action` | 7维动作：xyz(3) + axis_angle(3) + gripper(1) |
+| `steps/observation/ee_state` | 7维本体感知（与 action 同维） |
+| `steps/observation/front` | 前置摄像头 JPEG |
+| `steps/observation/wrist` | 腕部摄像头 JPEG |
+| `steps/observation/image_0/1` | 额外摄像头 JPEG |
+| `steps/language_instruction` | 语言指令（每步重复，取第0步） |
+
+动作空间 `vlabench_joint`：proprio 7维（LIBERO 是8维，少一个 gripper 状态），action 7维相同。

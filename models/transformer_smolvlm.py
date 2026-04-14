@@ -228,7 +228,7 @@ class DiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
     """DiT Final Layer with AdaLN."""
-    
+
     def __init__(self, hidden_size: int, out_dim: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -237,19 +237,168 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
         self.linear = nn.Linear(hidden_size, out_dim, bias=True)
-        
+
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.linear.weight, 0)
         nn.init.constant_(self.linear.bias, 0)
-    
+
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift, scale)
         return self.linear(x)
 
 
-# --------------------------- Main Model (SmolVLM Version) ---------------------------------------
+# --------------------------- SubgoalVAE (CVAE 子目标潜变量) ---------------------------------------
+
+class SubgoalVAE(nn.Module):
+    """
+    条件 VAE，将 VLM 特征（+ 训练时的动作块）编码为子目标潜变量 z_goal。
+
+    训练时：z ~ q(z | vlm_pooled, action_chunk)  — 后验，利用未来动作信息
+    推理时：z ~ p(z | vlm_pooled)               — 先验，仅依赖当前视觉-语言状态
+
+    z_goal 作为额外条件注入 AdaLN 动作 Transformer，使模型能够在潜在空间中
+    表示子任务的多模态分布，对长程任务中的阶段切换更鲁棒。
+    """
+
+    def __init__(
+        self,
+        vlm_hidden_size: int,
+        action_dim: int,
+        num_actions: int,
+        latent_dim: int = 64,
+        action_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        action_flat_dim = action_dim * num_actions
+
+        # 先验网络：p(z | vlm_pooled)
+        self.prior_net = nn.Sequential(
+            nn.Linear(vlm_hidden_size, 256),
+            nn.SiLU(),
+            nn.Linear(256, latent_dim * 2),
+        )
+
+        # 后验网络：q(z | vlm_pooled, action_chunk)
+        self.posterior_net = nn.Sequential(
+            nn.Linear(vlm_hidden_size + action_flat_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, latent_dim * 2),
+        )
+
+        self.action_dropout = nn.Dropout(action_dropout)
+
+        # 初始化：输出层接近零，使训练初期 z 接近标准正态
+        nn.init.constant_(self.prior_net[-1].weight, 0)
+        nn.init.constant_(self.prior_net[-1].bias, 0)
+        nn.init.constant_(self.posterior_net[-1].weight, 0)
+        nn.init.constant_(self.posterior_net[-1].bias, 0)
+
+    def encode_prior(self, vlm_pooled: torch.Tensor):
+        """从先验分布编码：p(z | vlm_pooled)。返回 (mu, log_var)，各 [B, latent_dim]。"""
+        params = self.prior_net(vlm_pooled)
+        return params.chunk(2, dim=-1)
+
+    def encode_posterior(self, vlm_pooled: torch.Tensor, action_chunk: torch.Tensor):
+        """从后验分布编码：q(z | vlm_pooled, action_chunk)。返回 (mu, log_var)，各 [B, latent_dim]。"""
+        B = vlm_pooled.shape[0]
+        action_flat = self.action_dropout(action_chunk.reshape(B, -1))
+        x = torch.cat([vlm_pooled, action_flat], dim=-1)
+        params = self.posterior_net(x)
+        return params.chunk(2, dim=-1)
+
+    def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """重参数化采样：z = mu + eps * std。"""
+        std = torch.exp(0.5 * log_var.clamp(-10, 10))
+        return mu + std * torch.randn_like(std)
+
+    def kl_loss(
+        self,
+        post_mu: torch.Tensor,
+        post_log_var: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_log_var: torch.Tensor,
+        free_bits: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        KL(q || p) 散度，使用 Free Bits 防止 KL 崩溃。
+
+        Free Bits：对每个潜变量维度，KL 低于 free_bits 时不计入梯度，
+        避免后验过早退化为先验。
+        """
+        prior_var = prior_log_var.exp().clamp(min=1e-6)
+        post_var = post_log_var.exp().clamp(min=1e-6)
+        kl_per_dim = 0.5 * (
+            prior_log_var - post_log_var
+            + (post_var + (post_mu - prior_mu) ** 2) / prior_var
+            - 1.0
+        )
+        # Free Bits：每维 KL 至少为 free_bits
+        kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+        return kl_per_dim.mean()
+
+
+# --------------------------- LatentFlowNet（z 空间 Flow Matching）-------------------------------
+
+class LatentFlowNet(nn.Module):
+    """
+    轻量 MLP，在 latent_dim 维的 z 空间做 Flow Matching。
+
+    以 vlm_pooled 为条件，从噪声 z_T 逐步积分到子目标潜变量 z_0。
+    与主干动作 Flow Matching 形成层次化双层扩散结构：
+      - z 空间（64维）：LatentFlowNet，5步 Euler 积分
+      - 动作空间（7维）：SmolVLMActionTransformer，10步 Euler 积分
+
+    训练时：z_0 来自 SubgoalVAE 后验，LatentFlowNet 学习从噪声到 z_0 的速度场
+    推理时：从 z_T ~ N(0,I) 出发，Euler 积分得到 z_goal，注入 AdaLN 条件
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 64,
+        vlm_hidden_size: int = 576,
+        hidden: int = 256,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # 将 vlm_pooled 压缩到 latent_dim，与 z_t 和 t_emb 维度对齐
+        self.vlm_proj = nn.Linear(vlm_hidden_size, latent_dim)
+
+        # 速度场网络：输入 [z_t, t_emb, vlm_cond] 拼接
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim * 3, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, latent_dim),
+        )
+
+        # 输出层初始化为零，训练初期不干扰 CVAE 收敛
+        nn.init.constant_(self.net[-1].weight, 0)
+        nn.init.constant_(self.net[-1].bias, 0)
+
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor, vlm_pooled: torch.Tensor) -> torch.Tensor:
+        """
+        预测 z 空间速度场。
+
+        Parameters
+        ----------
+        z_t       : [B, latent_dim]  — 当前时刻的 z
+        t         : [B]              — 时间步（0~1）
+        vlm_pooled: [B, vlm_hidden_size] — VLM 全局特征（条件）
+
+        Returns
+        -------
+        v_z : [B, latent_dim]  — 预测速度场
+        """
+        t_emb = timestep_embedding(t, self.latent_dim)          # [B, latent_dim]
+        vlm_cond = self.vlm_proj(vlm_pooled)                    # [B, latent_dim]
+        x = torch.cat([z_t, t_emb, vlm_cond], dim=-1)          # [B, latent_dim*3]
+        return self.net(x)                                       # [B, latent_dim]
+
 
 class SmolVLMActionTransformer(nn.Module):
     """
@@ -277,6 +426,9 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        use_subgoal_vae: bool = False,
+        subgoal_latent_dim: int = 64,
+        num_actions: int = 10,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -284,13 +436,14 @@ class SmolVLMActionTransformer(nn.Module):
         self.dim_time = dim_time
         self.dim_propio = dim_propio
         self.use_adaln = use_adaln
+        self.use_subgoal_vae = use_subgoal_vae
 
         if use_adaln:
             # ========== DiT Mode: AdaLN ==========
             self.blocks = nn.ModuleList(
                 [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
             )
-            
+
             # Condition encoders
             self.time_proj = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
@@ -301,16 +454,31 @@ class SmolVLMActionTransformer(nn.Module):
             self.vlm_cond_proj = nn.Linear(vlm_hidden_size, hidden_size)
             # Proprio projection
             self.proprio_proj = nn.Linear(dim_propio, hidden_size)
-            
+
             # Action encoder
             self.action_encoder = nn.Linear(dim_action, hidden_size)
-            
+
             # Position encoding
             self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
             nn.init.normal_(self.pos_emb, std=0.02)
-            
+
             # Final layer
             self.final_layer = FinalLayer(hidden_size, dim_action)
+
+            # CVAE 子目标潜变量（仅 AdaLN 模式支持）
+            if use_subgoal_vae:
+                self.subgoal_vae = SubgoalVAE(
+                    vlm_hidden_size=vlm_hidden_size,
+                    action_dim=dim_action,
+                    num_actions=num_actions,
+                    latent_dim=subgoal_latent_dim,
+                )
+                self.subgoal_proj = nn.Linear(subgoal_latent_dim, hidden_size)
+                # z 空间 Flow Matching 网络（LDM）
+                self.latent_flow_net = LatentFlowNet(
+                    latent_dim=subgoal_latent_dim,
+                    vlm_hidden_size=vlm_hidden_size,
+                )
         else:
             # ========== Concat Mode: Original architecture ==========
             self.blocks = nn.ModuleList(
@@ -338,6 +506,7 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        z_goal: torch.Tensor | None = None,  # [B, latent_dim] - 子目标潜变量（可选）
     ) -> torch.Tensor:
         """
         Forward pass for SmolVLM Action Transformer.
@@ -348,13 +517,14 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise : [B, T_action, dim_action]
         proprio : [B, dim_proprio]
         t : [B]
+        z_goal : [B, latent_dim] - 子目标潜变量，仅 AdaLN 模式使用（可选）
 
         Returns
         -------
         Tensor: Predicted velocity, [B, T_action, dim_action]
         """
         if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
+            return self._forward_adaln(vlm_features, action_with_noise, proprio, t, z_goal=z_goal)
         else:
             return self._forward_concat(vlm_features, action_with_noise, proprio, t)
     
@@ -405,45 +575,52 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        z_goal: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         DiT/AdaLN mode forward pass.
-        
-        Conditions (time, vlm, proprio) injected via AdaLN.
+
+        Conditions (time, vlm, proprio, z_goal) injected via AdaLN.
         No aux_visual needed for SmolVLM.
         """
         B, num_actions = action_with_noise.shape[:2]
-        
+
         # ========== 1. Build global condition c ==========
         # Time embedding
         t_emb = timestep_embedding(t, self.hidden_size)
         t_emb = self.time_proj(t_emb)  # [B, H]
-        
+
         # VLM condition: Global Average Pooling
         vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
+
         # Proprio condition
         proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
+
         # Fuse all conditions
         c = t_emb + vlm_cond + proprio_cond  # [B, H]
-        
+
+        # 子目标潜变量条件（若启用）
+        if z_goal is not None and self.use_subgoal_vae:
+            c = c + self.subgoal_proj(z_goal)  # [B, H]
+
         # ========== 2. Encode action sequence ==========
         x = self.action_encoder(action_with_noise)  # [B, T_action, H]
-        
+
         # Add position encoding
         x = x + self.pos_emb[:, :num_actions, :]
-        
+
         # ========== 3. DiT Blocks with AdaLN ==========
         for block in self.blocks:
             x = block(x, c)
-        
+
         # ========== 4. Final Layer with AdaLN ==========
         return self.final_layer(x, c)
 
 
 __all__ = [
     "SmolVLMActionTransformer",
+    "SubgoalVAE",
+    "LatentFlowNet",
     "TransformerBlock",
     "DiTBlock",
     "FinalLayer",
