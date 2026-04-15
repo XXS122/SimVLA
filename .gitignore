@@ -1,13 +1,9 @@
 *.log
 .env
-**/temp/
-datasets/
+datasets/metas
 runs/
 evaluation/libero/eval_simvla_8102
 *.tar.gz
 *.json
-assets/
-assets/SimVLA/
-assets/VLABench/
 simvla_output/
 models/__pycache__
