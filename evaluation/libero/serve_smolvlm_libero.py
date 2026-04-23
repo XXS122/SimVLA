@@ -64,14 +64,21 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     global model, processor
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
-    
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
+    # 若提供了本地 smolvlm_model_path，覆盖 config 中可能残留的旧服务器路径
+    if smolvlm_model_path:
+        from models.configuration_smolvlm_vla import SmolVLMVLAConfig
+        cfg = SmolVLMVLAConfig.from_pretrained(checkpoint_path)
+        logger.info(f"覆盖 smolvlm_model_path: {cfg.smolvlm_model_path} -> {smolvlm_model_path}")
+        cfg.smolvlm_model_path = smolvlm_model_path
+        model = SmolVLMVLA.from_pretrained(checkpoint_path, config=cfg)
+    else:
+        model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
     model = model.to(device)
     model.eval()
-    
-    # smolvlm_path = smolvlm_model_path or "/data/kcl/zz/hyj/model/smolvla"
-    print(smolvlm_model_path)
-    smolvlm_path = smolvlm_model_path
+
+    smolvlm_path = smolvlm_model_path or model.config.smolvlm_model_path
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
     
     if norm_stats_path and os.path.exists(norm_stats_path):
@@ -270,7 +277,7 @@ def main():
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
     parser.add_argument("--smolvlm_model", type=str, 
-                        default="/data/kcl/zz/hyj/model/smolvla",
+                        default="/root/model/smolvlm-500M",
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

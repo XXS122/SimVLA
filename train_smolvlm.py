@@ -86,7 +86,7 @@ def get_args_parser():
 
     # SmolVLM backbone
     parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="/data/kcl/zz/hyj/model/smolvla",
+                        default="/root/model/smolvlm-500M",
                         help="Path or HF repo for SmolVLM backbone")
     
     # Data

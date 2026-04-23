@@ -16,7 +16,7 @@
 
 用法：
     python compute_vlabench_norm_stats.py \\
-        --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \\
+        --data_dir /root/dataset/vlabench-data/1.0.0 \\
         --output ./norm_stats/vlabench_norm.json \\
         --max_shards 50
 """
@@ -139,7 +139,7 @@ def compute_norm_stats(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/data/kcl/zz/hyj/vlabench/data/1.0.0")
+    parser.add_argument("--data_dir", type=str, default="/root/dataset/vlabench-data/1.0.0")
     parser.add_argument("--output", type=str, default="./norm_stats/vlabench_norm.json")
     parser.add_argument("--max_shards", type=int, default=0, help="限制处理的 shard 数量，0 表示全部")
     parser.add_argument("--split", type=str, default="train")

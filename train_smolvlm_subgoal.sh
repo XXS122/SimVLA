@@ -35,10 +35,10 @@ export TF_CPP_MIN_LOG_LEVEL=2
 # =============================================================================
 # 路径配置
 # =============================================================================
-VLABENCH_DATA_DIR="/data/kcl/zz/hyj/vlabench/data/1.0.0"
+VLABENCH_DATA_DIR="/root/dataset/vlabench-data/1.0.0"
 NORM_STATS_PATH="./norm_stats/vlabench_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/vlabench_train.json"
-SMOLVLM_MODEL="/data/kcl/zz/hyj/model/smolvla"
+SMOLVLM_MODEL="/root/model/smolvlm-500M"
 
 # =============================================================================
 # 训练超参数

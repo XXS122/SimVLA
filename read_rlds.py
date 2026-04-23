@@ -7,7 +7,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
 # 2. 你的准确路径
-DATA_DIR = "/data/kcl/zz/hyj/code/VLABench-data/rlds/1.0.0"
+DATA_DIR = "/root/VLABench-data/rlds/1.0.0"
 
 def extract_one_frame():
     print(f"正在从目录加载数据集: {DATA_DIR}...")

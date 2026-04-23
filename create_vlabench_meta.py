@@ -3,7 +3,7 @@
 
 用法：
     python create_vlabench_meta.py \
-        --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \
+        --data_dir /root/dataset/vlabench-data/1.0.0 \
         --output ./datasets/metas/vlabench_train.json \
         --obs_cameras front wrist
 """
@@ -50,7 +50,7 @@ def create_vlabench_meta(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/data/kcl/zz/hyj/vlabench/data/1.0.0")
+    parser.add_argument("--data_dir", type=str, default="/root/dataset/vlabench-data/1.0.0")
     parser.add_argument("--output", type=str, default="./datasets/metas/vlabench_train.json")
     parser.add_argument("--obs_cameras", nargs="+", default=["front", "wrist"])
     parser.add_argument("--split", type=str, default="train")

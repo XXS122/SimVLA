@@ -6,13 +6,17 @@
 
 **重要：所有回答、解释、代码注释均必须使用中文。**
 
+## 文档维护要求
+
+**重要：每次对话结束后，若出现了新的命令、路径、参数或操作流程，必须立即更新到本 CLAUDE.md 文档对应章节中，保持文档与实际使用一致。**
+
 ## 命令
 
 ### 环境配置
 ```bash
 conda create -n simvla python=3.10 -y && conda activate simvla
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install transformers>=4.57.0
+pip install transformers==4.57.0
 pip install peft accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
 pip install flash-attn==2.5.6 --no-build-isolation
 pip install tensorflow tensorflow-datasets
@@ -35,16 +39,16 @@ python compute_libero_norm_stats.py \
 
 ### 数据准备（VLABench）
 ```bash
-# 数据位置：/data/kcl/zz/hyj/vlabench/data/1.0.0（RLDS TFRecord 格式，512个shard）
+# 数据位置：/root/dataset/vlabench-data/1.0.0（RLDS TFRecord 格式，512个shard）
 
 # 1. 生成数据集元数据 JSON
 python create_vlabench_meta.py \
-    --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \
+    --data_dir /root/dataset/vlabench-data/1.0.0 \
     --output ./datasets/metas/vlabench_train.json
 
 # 2. 计算动作/状态归一化统计量
 python compute_vlabench_norm_stats.py \
-    --data_dir /data/kcl/zz/hyj/vlabench/data/1.0.0 \
+    --data_dir /root/dataset/vlabench-data/1.0.0 \
     --output ./norm_stats/vlabench_norm.json
 # 可加 --max_shards 50 用部分数据加速估算
 ```
@@ -102,14 +106,14 @@ apt-get update && apt-get install -y libegl1 libgl1-mesa-glx libglib2.0-0
 # 下载 VLABench 资源文件（需手动从 Google Drive 下载并解压）
 # obj.zip: https://drive.google.com/file/d/1ldEMZua2OzXHJTYTCP0IGVU1aFYBCMu-/view
 # scene.zip: https://drive.google.com/file/d/1KdReRkibJClBHHD32jz_wTkaBzhEJ9Kw/view
-# 解压到 /data/kcl/zz/hyj/code/VLABench/VLABench/assets/
+# 解压到 /root/code/VLABench/VLABench/assets/
 ```
 
 #### 2. 生成 track_5_long_horizon 测试集
 ```bash
 conda activate vlabench
-cd /data/kcl/zz/hyj/code/VLABench
-VLABENCH_ROOT=/data/kcl/zz/hyj/code/VLABench/VLABench MUJOCO_GL=egl \
+cd /root/code/VLABench
+VLABENCH_ROOT=/root/code/VLABench/VLABench MUJOCO_GL=egl \
 python generate_track5_long_horizon.py --n-episodes 50
 
 # 输出：VLABench/configs/evaluation/tracks/track_5_long_horizon.json
@@ -129,12 +133,12 @@ python generate_track5_long_horizon.py --n-episodes 50
 #### 3. 启动推理服务器（simvla 环境）
 ```bash
 conda activate simvla
-cd /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench
+cd /root/code/SimVLA/evaluation/vlabench
 
 CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
-    --checkpoint /data/kcl/zz/hyj/code/SimVLA/simvla_output/simvla_vlabench_small/ckpt-10000 \
+    --checkpoint /root/checkpoint/simvla_output/ckpt-100000 \
     --norm_stats ../../norm_stats/vlabench_norm.json \
-    --smolvlm_model /data/kcl/zz/hyj/model/smolvla \
+    --smolvlm_model /root/model/smolvlm-500M \
     --port 8001
 
 # 服务器监听 0.0.0.0:8001，使用 WebSocket + msgpack 协议
@@ -144,13 +148,13 @@ CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
 #### 4. 运行评估（vlabench 环境，另开终端）
 ```bash
 conda activate vlabench
-cd /data/kcl/zz/hyj/code/VLABench
+cd /root/code/VLABench
 
-python /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
-    --eval-track track_5_long_horizon \
+python /root/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
+    --eval-track track_1_in_distribution \
     --n-episode 10 \
     --port 8001 \
-    --save-dir /data/kcl/zz/hyj/code/SimVLA/simvla_output/eval_results
+    --save-dir /root/eval_results
 
 # 支持的 track：
 #   track_1_in_distribution, track_2_cross_category, track_3_common_sense,
@@ -165,9 +169,50 @@ python /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
 #### 5. 查看结果
 ```bash
 # 结果保存在：
-# /datasets/simvla_output/eval_results/track_5_long_horizon/simvla/evaluation_result.json
+# /root/eval_results/{track}_{timestamp}/simvla/evaluation_result.json
 
-cat /datasets/simvla_output/eval_results/track_5_long_horizon/simvla/evaluation_result.json
+cat /root/eval_results/track_5_long_horizon_20260415_1100/simvla/evaluation_result.json
+
+# 每个 task 完成后也会增量保存到：
+# /root/eval_results/{track}_{timestamp}/metrics.json
+# /root/eval_results/{track}_{timestamp}/{task}/detail_info.json
+```
+
+#### 6. 并行评估（同时跑多个 track，需多张 GPU）
+```bash
+# 终端1：推理服务器1（GPU 0，port 8001）
+conda activate simvla
+cd /root/code/SimVLA/evaluation/vlabench
+CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
+    --checkpoint /root/checkpoint/simvla_output/ckpt-100000 \
+    --norm_stats ../../norm_stats/vlabench_norm.json \
+    --smolvlm_model /root/model/smolvlm-500M \
+    --port 8001
+
+# 终端2：推理服务器2（GPU 1，port 8002）
+conda activate simvla
+cd /root/code/SimVLA/evaluation/vlabench
+CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
+    --checkpoint /root/checkpoint/simvla_output/ckpt-100000 \
+    --norm_stats ../../norm_stats/vlabench_norm.json \
+    --smolvlm_model /root/model/smolvlm-500M \
+    --port 8002
+
+# 终端3：评估客户端1（连 port 8001，跑 track_1）
+(choose from 'track_1_in_distribution', 'track_2_cross_category', 'track_3_common_sense', 'track_4_semantic_instruction', 'track_5_long_horizon', 'track_6_unseen_texture')
+conda activate vlabench
+cd /root/code/VLABench
+python /root/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
+    --eval-track track_2_cross_category \
+    --n-episode 10 --port 8001 --save-dir /root/eval_results
+
+# 终端4：评估客户端2（连 port 8002，跑 track_2）
+conda activate vlabench
+cd /root/code/VLABench
+python /root/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
+    --eval-track track_5_long_horizon \
+    --n-episode 10 --port 8002 --save-dir /root/eval_results
+# 注意：每个客户端用不同 port，save-dir 相同但 track 名不同，结果目录自动区分
 ```
 
 关键训练参数：`--use_adaln`（DiT 风格条件注入）、`--image_size 384|512`、`--num_actions 10`、`--freeze_steps 1000`（前 N 步冻结 VLM）、`--learning_coef 0.1`（VLM 学习率倍率）。
@@ -216,7 +261,7 @@ SmolVLMVLA.forward()
 | `train_smolvlm_subgoal.sh` | VLABench + CVAE 子目标潜变量训练脚本（AdaLN + SubgoalVAE，双卡 A800） |
 | `create_vlabench_meta.py` | 生成 VLABench 训练元数据 JSON（扫描 TFRecord shard 列表） |
 | `compute_vlabench_norm_stats.py` | 计算 VLABench 动作/状态归一化统计量，复用 `RunningStats`，输出格式与 LIBERO 一致 |
-| `/data/kcl/zz/hyj/code/VLABench/generate_track5_long_horizon.py` | 生成 track_5_long_horizon.json（7个长期任务，每任务50 episode），在 vlabench 环境下运行 |
+| `/root/code/VLABench/generate_track5_long_horizon.py` | 生成 track_5_long_horizon.json（7个长期任务，每任务50 episode），在 vlabench 环境下运行 |
 | `evaluation/libero/serve_smolvlm_libero.py` | LIBERO WebSocket 推理服务器（msgpack_numpy 序列化） |
 | `evaluation/vlabench/serve_smolvlm_vlabench.py` | VLABench WebSocket 推理服务器，含 quat→axis_angle 状态转换 |
 | `evaluation/vlabench/evaluate_simvla.py` | VLABench 评估客户端，复用 OpenPiPolicy 协议，支持全部6个 track |
@@ -251,7 +296,7 @@ SmolVLMVLA.forward()
 
 ### VLABench 数据集说明
 
-数据位置：`/data/kcl/zz/hyj/vlabench/data/1.0.0`，RLDS TFRecord 格式，512个 shard。
+数据位置：`/root/dataset/vlabench-data/1.0.0`，RLDS TFRecord 格式，512个 shard。
 
 | 字段 | 说明 |
 |---|---|

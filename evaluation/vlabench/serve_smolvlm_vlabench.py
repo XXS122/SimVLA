@@ -7,9 +7,9 @@ SimVLA VLABench 推理服务器（WebSocket）
 启动方式（simvla 环境）：
     conda activate simvla
     CUDA_VISIBLE_DEVICES=0 python serve_smolvlm_vlabench.py \
-        --checkpoint /data/kcl/zz/hyj/code/SimVLA/simvla_output/simvla_vlabench_small/ckpt-10000 \
+        --checkpoint /root/SimVLA/simvla_output/simvla_vlabench_small/ckpt-10000 \
         --norm_stats ../../norm_stats/vlabench_norm.json \
-        --smolvlm_model /data/kcl/zz/hyj/model/smolvla \
+        --smolvlm_model /root/model/smolvlm-500M \
         --port 8001
 """
 
@@ -79,11 +79,21 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     global model, processor
 
     logger.info(f"加载 SimVLA from {checkpoint_path} ...")
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
+    # 若提供了本地 smolvlm_model_path，覆盖 config 中可能残留的旧服务器路径
+    if smolvlm_model_path:
+        from models.configuration_smolvlm_vla import SmolVLMVLAConfig
+        cfg = SmolVLMVLAConfig.from_pretrained(checkpoint_path)
+        logger.info(f"覆盖 smolvlm_model_path: {cfg.smolvlm_model_path} -> {smolvlm_model_path}")
+        cfg.smolvlm_model_path = smolvlm_model_path
+        model = SmolVLMVLA.from_pretrained(checkpoint_path, config=cfg)
+    else:
+        model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
     model = model.to(device)
     model.eval()
 
-    processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_model_path)
+    processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_model_path or model.config.smolvlm_model_path)
 
     if norm_stats_path and os.path.exists(norm_stats_path):
         logger.info(f"加载 norm stats: {norm_stats_path}")
@@ -196,7 +206,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--norm_stats", type=str, default=None)
     parser.add_argument("--smolvlm_model", type=str,
-                        default="/data/kcl/zz/hyj/model/smolvla")
+                        default="/root/model/smolvlm-500M")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()

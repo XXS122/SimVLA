@@ -29,7 +29,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
     def __init__(
         self,
         # === SmolVLM backbone ===
-        smolvlm_model_path: str = "/data/kcl/zz/hyj/model/smolvla",
+        smolvlm_model_path: str = "/root/model/smolvlm-500M",
         
         # === Transformer head ===
         hidden_size: int = 768,  # Action transformer hidden size

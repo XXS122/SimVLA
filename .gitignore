@@ -7,3 +7,4 @@ evaluation/libero/eval_simvla_8102
 *.json
 simvla_output/
 models/__pycache__
+*.pyc

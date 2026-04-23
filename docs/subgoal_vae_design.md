@@ -236,7 +236,7 @@ step=10000+: λ_kl = 0.001    （达到最终权重，稳定训练）
 ### 完整训练（推荐，双卡 A800）
 
 ```bash
-cd /data/kcl/zz/hyj/code/SimVLA
+cd /root/SimVLA
 bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal
 ```
 
@@ -258,7 +258,7 @@ accelerate launch --num_processes=2 --main_process_port 29507 --mixed_precision 
     train_smolvlm.py \
     --output_dir ./simvla_output/ablation_cvae \
     --train_metas_path ./datasets/metas/vlabench_train.json \
-    --smolvlm_model_path /data/kcl/zz/hyj/model/smolvla \
+    --smolvlm_model_path /root/model/smolvlm-500M \
     --action_mode vlabench_joint \
     --norm_stats_path ./norm_stats/vlabench_norm.json \
     --use_adaln --use_subgoal_vae \
@@ -301,17 +301,17 @@ conda activate simvla
 CUDA_VISIBLE_DEVICES=0 python evaluation/vlabench/serve_smolvlm_vlabench.py \
     --checkpoint ./simvla_output/simvla_subgoal/ckpt-100000 \
     --norm_stats ./norm_stats/vlabench_norm.json \
-    --smolvlm_model /data/kcl/zz/hyj/model/smolvla \
+    --smolvlm_model /root/model/smolvlm-500M \
     --port 8001
 
 # 评估（重点关注 track_5_long_horizon）
 conda activate vlabench
-cd /data/kcl/zz/hyj/code/VLABench
-python /data/kcl/zz/hyj/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
+cd /root/VLABench
+python /root/SimVLA/evaluation/vlabench/evaluate_simvla.py \
     --eval-track track_5_long_horizon \
     --n-episode 50 \
     --port 8001 \
-    --save-dir /data/kcl/zz/hyj/code/SimVLA/simvla_output/eval_results
+    --save-dir /root/SimVLA/simvla_output/eval_results
 ```
 
 ---
