@@ -12,6 +12,7 @@ Optimized version with:
 
 from transformers import AutoProcessor, AutoTokenizer, AutoImageProcessor
 from typing import List, Union, Dict, Any, Optional
+import os
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -49,7 +50,7 @@ class SmolVLMVLAProcessor:
         self, 
         image_processor=None, 
         tokenizer=None,
-        smolvlm_model_path: str = "/root/model/smolvlm-500M",
+        smolvlm_model_path: str = os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"),
     ):
         """
         Initialize SmolVLMVLAProcessor.
@@ -113,7 +114,7 @@ class SmolVLMVLAProcessor:
         except Exception as e:
             print(f"Warning: Could not load from {smolvlm_path}: {e}")
             print("Using default SmolVLM-500M-Instruct")
-            return cls(smolvlm_model_path="/root/model/smolvlm-500M")
+            return cls(smolvlm_model_path=os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"))
 
     # ================== LANGUAGE ENCODING ==================
     def encode_language(self, language_instruction: Union[str, List[str]]) -> Dict[str, torch.Tensor]:

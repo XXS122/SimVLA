@@ -14,16 +14,22 @@ echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
-export CUDA_VISIBLE_DEVICES=6,7
 export TF_CPP_MIN_LOG_LEVEL=2
 
 # =============================================================================
-# Path configuration
+# Path configuration（从 paths.env 加载机器特定路径，不存在则用默认值）
 # =============================================================================
-VLABENCH_DATA_DIR="/root/dataset/vlabench-data/1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${SCRIPT_DIR}/paths.env" ] && source "${SCRIPT_DIR}/paths.env"
+
+# GPU 配置（从 paths.env 读取，默认双卡 6,7）
+export CUDA_VISIBLE_DEVICES="${SIMVLA_CUDA_DEVICES:-6,7}"
+NUM_PROCESSES="${SIMVLA_NUM_GPUS:-2}"
+
+VLABENCH_DATA_DIR="${SIMVLA_VLABENCH_DATA:-/root/dataset/vlabench-data/1.0.0}"
 NORM_STATS_PATH="./norm_stats/vlabench_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/vlabench_train.json"
-SMOLVLM_MODEL="/root/model/smolvlm-500M"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-/root/model/smolvlm-500M}"
 
 # ===============================================================
 # Training hyperparameters
@@ -42,6 +48,11 @@ HIDDEN_SIZE=768
 DEPTH=12
 NUM_HEADS=12
 USE_ADALN=false
+
+# 损失函数与时间步采样（新增）
+USE_HUBER_LOSS=true       # Huber loss 替代 MSE
+GRIPPER_WEIGHT=5.0        # gripper 维度损失权重
+TIME_SAMPLING="logit_normal"  # 时间步采样策略：beta | logit_normal | cosine
 
 # =============================================================================
 # Step 1: Create training metadata (if not exists)
@@ -91,6 +102,12 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
+if [ "${USE_HUBER_LOSS}" = true ]; then
+    ARGS="${ARGS} --use_huber_loss --gripper_weight ${GRIPPER_WEIGHT}"
+fi
+
+ARGS="${ARGS} --time_sampling ${TIME_SAMPLING}"
+
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
 fi
@@ -102,7 +119,7 @@ echo "============================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=2 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

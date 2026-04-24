@@ -139,7 +139,8 @@ def compute_norm_stats(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/root/dataset/vlabench-data/1.0.0")
+    parser.add_argument("--data_dir", type=str,
+                        default=os.environ.get("SIMVLA_VLABENCH_DATA", "/root/dataset/vlabench-data/1.0.0"))
     parser.add_argument("--output", type=str, default="./norm_stats/vlabench_norm.json")
     parser.add_argument("--max_shards", type=int, default=0, help="限制处理的 shard 数量，0 表示全部")
     parser.add_argument("--split", type=str, default="train")

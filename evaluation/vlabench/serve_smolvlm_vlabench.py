@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--norm_stats", type=str, default=None)
     parser.add_argument("--smolvlm_model", type=str,
-                        default="/root/model/smolvlm-500M")
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"))
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()

@@ -5,6 +5,7 @@ Configuration class for SmolVLM-500M-Instruct based VLA model.
 Uses SmolVLM as the vision-language backbone instead of Florence2.
 """
 
+import os
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -29,7 +30,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
     def __init__(
         self,
         # === SmolVLM backbone ===
-        smolvlm_model_path: str = "/root/model/smolvlm-500M",
+        smolvlm_model_path: str = os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"),
         
         # === Transformer head ===
         hidden_size: int = 768,  # Action transformer hidden size
@@ -46,6 +47,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
+        use_cross_attn: bool = True,     # AdaLN 模式下是否启用 cross-attention to VLM 全序列
 
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
@@ -60,6 +62,14 @@ class SmolVLMVLAConfig(PretrainedConfig):
         use_latent_flow: bool = True,    # 是否用 LDM 替换先验采样（配合 use_subgoal_vae）
         latent_flow_steps: int = 5,      # 推理时 z 空间 Euler 积分步数
         latent_fm_weight: float = 1.0,   # latent FM 损失权重
+
+        # === 损失函数 ===
+        use_huber_loss: bool = False,    # True: Huber loss，False: MSE
+        huber_delta: float = 1.0,        # Huber loss 的 delta 参数
+        gripper_weight: float = 1.0,     # gripper 维度损失权重倍率
+
+        # === 时间步采样策略 ===
+        time_sampling: str = 'beta',     # 'beta' | 'logit_normal' | 'cosine'
 
         **kwargs,
     ):
@@ -81,6 +91,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
+        self.use_cross_attn = use_cross_attn
 
         # Image settings
         self.image_size = image_size
@@ -95,6 +106,14 @@ class SmolVLMVLAConfig(PretrainedConfig):
         self.use_latent_flow = use_latent_flow
         self.latent_flow_steps = latent_flow_steps
         self.latent_fm_weight = latent_fm_weight
+
+        # 损失函数设置
+        self.use_huber_loss = use_huber_loss
+        self.huber_delta = huber_delta
+        self.gripper_weight = gripper_weight
+
+        # 时间步采样策略
+        self.time_sampling = time_sampling
 
         # Initialize base HF config attributes
         super().__init__(**kwargs)

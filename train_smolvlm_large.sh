@@ -23,21 +23,23 @@ echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
 
 # =============================================================================
-# Path configuration
+# Path configuration（从 paths.env 加载机器特定路径，不存在则用默认值）
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${SCRIPT_DIR}/paths.env" ] && source "${SCRIPT_DIR}/paths.env"
+
+# GPU 配置（从 paths.env 读取，默认4卡 4,5,6,7）
+export CUDA_VISIBLE_DEVICES="${SIMVLA_CUDA_DEVICES:-4,5,6,7}"
+NUM_PROCESSES="${SIMVLA_NUM_GPUS:-4}"
+
+LIBERO_DATA_DIR="${SIMVLA_LIBERO_DATA:-/root/dataset/libero}"
 NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
-
-# SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="/root/model/smolvlm-500M"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-/root/model/smolvlm-500M}"
 
 # =============================================================================
 # Training hyperparameters
@@ -144,7 +146,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

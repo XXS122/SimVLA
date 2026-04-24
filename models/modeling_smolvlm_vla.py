@@ -17,8 +17,10 @@ import logging
 import traceback
 from typing import Any, Dict
 
+import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -84,6 +86,7 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
+        self.use_cross_attn = getattr(config, 'use_cross_attn', True)
 
         # CVAE 子目标潜变量设置
         self.use_subgoal_vae = getattr(config, 'use_subgoal_vae', False)
@@ -93,6 +96,14 @@ class SmolVLMVLA(PreTrainedModel):
         self.use_latent_flow = getattr(config, 'use_latent_flow', True)
         self.latent_flow_steps = getattr(config, 'latent_flow_steps', 5)
         self.latent_fm_weight = getattr(config, 'latent_fm_weight', 1.0)
+
+        # 损失函数设置
+        self.use_huber_loss = getattr(config, 'use_huber_loss', False)
+        self.huber_delta = getattr(config, 'huber_delta', 1.0)
+        self.gripper_weight = getattr(config, 'gripper_weight', 1.0)
+
+        # 时间步采样策略
+        self.time_sampling = getattr(config, 'time_sampling', 'beta')
 
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
@@ -106,6 +117,7 @@ class SmolVLMVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
+            use_cross_attn=self.use_cross_attn,
             use_subgoal_vae=self.use_subgoal_vae,
             subgoal_latent_dim=getattr(config, 'subgoal_latent_dim', 64),
             num_actions=config.num_actions,
@@ -357,13 +369,23 @@ class SmolVLMVLA(PreTrainedModel):
 
         B = input_ids.shape[0]
         device = input_ids.device
-        
-        # Beta(1.5, 1) time sampling
-        beta_dist = torch.distributions.Beta(
-            torch.tensor(1.5, device=device), 
-            torch.tensor(1.0, device=device)
-        )
-        t = beta_dist.sample((B,)) * 0.999 + 0.001
+
+        # 时间步采样
+        if self.time_sampling == 'logit_normal':
+            # Logit-Normal(0, 1)：在 t=0.5 附近更均匀，低时间步样本更多
+            u = torch.randn(B, device=device)
+            t = torch.sigmoid(u) * 0.999 + 0.0005
+        elif self.time_sampling == 'cosine':
+            # Cosine schedule：偏向 t→0（精细去噪阶段）
+            u = torch.rand(B, device=device)
+            t = 1.0 - torch.cos(u * math.pi / 2) * 0.999
+        else:
+            # 默认：Beta(1.5, 1)
+            beta_dist = torch.distributions.Beta(
+                torch.tensor(1.5, device=device),
+                torch.tensor(1.0, device=device)
+            )
+            t = beta_dist.sample((B,)) * 0.999 + 0.001
 
         # Normalize action and proprio
         if hasattr(self.action_space, 'normalize_action'):
@@ -405,8 +427,16 @@ class SmolVLMVLA(PreTrainedModel):
 
             # z 空间 Flow Matching 损失（LDM）
             if self.use_latent_flow:
+                # 复用已采样的 t（或单独采样 t_z）
+                if self.time_sampling == 'logit_normal':
+                    u_z = torch.randn(B, device=device)
+                    t_z = torch.sigmoid(u_z) * 0.999 + 0.0005
+                elif self.time_sampling == 'cosine':
+                    u_z = torch.rand(B, device=device)
+                    t_z = 1.0 - torch.cos(u_z * math.pi / 2) * 0.999
+                else:
+                    t_z = beta_dist.sample((B,)) * 0.999 + 0.001
                 z_noise = torch.randn_like(z_0)
-                t_z = beta_dist.sample((B,)) * 0.999 + 0.001
                 t_z_exp = t_z.view(-1, 1)
                 z_t_latent = t_z_exp * z_noise + (1 - t_z_exp) * z_0
                 u_z = z_noise - z_0
@@ -425,8 +455,18 @@ class SmolVLMVLA(PreTrainedModel):
             z_goal=z_goal,
         )
 
-        # MSE loss
-        velocity_loss = torch.mean(torch.square(v_t - u_t))
+        # 损失函数：Huber 或 MSE，支持 gripper 维度加权
+        if self.use_huber_loss:
+            per_dim_loss = F.huber_loss(v_t, u_t, delta=self.huber_delta, reduction='none')
+        else:
+            per_dim_loss = torch.square(v_t - u_t)
+
+        if self.gripper_weight != 1.0:
+            weight = torch.ones_like(per_dim_loss)
+            weight[..., -1] = self.gripper_weight  # gripper 是最后一维
+            per_dim_loss = per_dim_loss * weight
+
+        velocity_loss = per_dim_loss.mean()
 
         loss_dict = {"velocity_loss": velocity_loss}
         if kl_loss is not None:

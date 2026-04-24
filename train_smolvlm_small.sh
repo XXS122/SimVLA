@@ -23,22 +23,23 @@ echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
-# GPU configuration
-# export CUDA_VISIBLE_DEVICES=0
-export CUDA_VISIBLE_DEVICES=6,7
-
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
 
 # =============================================================================
-# Path configuration
+# Path configuration（从 paths.env 加载机器特定路径，不存在则用默认值）
 # =============================================================================
-LIBERO_DATA_DIR="/datasets"
-NORM_STATS_PATH="./norm_stats/libero_norm.json"
-TRAIN_METAS_PATH="/datasets/simvla/libero_train.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${SCRIPT_DIR}/paths.env" ] && source "${SCRIPT_DIR}/paths.env"
 
-# SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="/root/model/smolvlm-500M"
+# GPU 配置（从 paths.env 读取，默认双卡 6,7）
+export CUDA_VISIBLE_DEVICES="${SIMVLA_CUDA_DEVICES:-6,7}"
+NUM_PROCESSES="${SIMVLA_NUM_GPUS:-2}"
+
+LIBERO_DATA_DIR="${SIMVLA_LIBERO_DATA:-/root/dataset/libero}"
+NORM_STATS_PATH="./norm_stats/libero_norm.json"
+TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-/root/model/smolvlm-500M}"
 
 # =============================================================================
 # Training hyperparameters
@@ -144,7 +145,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=2 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

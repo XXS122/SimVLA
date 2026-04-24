@@ -1,5 +1,6 @@
 *.log
 .env
+paths.env
 datasets/metas
 runs/
 evaluation/libero/eval_simvla_8102
@@ -7,4 +8,6 @@ evaluation/libero/eval_simvla_8102
 *.json
 simvla_output/
 models/__pycache__
+*.cpython-311.pyc
 *.pyc
+__pycache__/

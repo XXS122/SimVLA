@@ -276,8 +276,8 @@ def main():
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str, 
-                        default="/root/model/smolvlm-500M",
+    parser.add_argument("--smolvlm_model", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"),
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

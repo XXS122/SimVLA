@@ -29,16 +29,22 @@ echo "   resume_ckpt:   ${RESUME_CKPT:-'None (training from scratch)'}"
 # =============================================================================
 # 环境变量
 # =============================================================================
-export CUDA_VISIBLE_DEVICES=6,7
 export TF_CPP_MIN_LOG_LEVEL=2
 
 # =============================================================================
-# 路径配置
+# 路径配置（从 paths.env 加载机器特定路径，不存在则用默认值）
 # =============================================================================
-VLABENCH_DATA_DIR="/root/dataset/vlabench-data/1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${SCRIPT_DIR}/paths.env" ] && source "${SCRIPT_DIR}/paths.env"
+
+# GPU 配置（从 paths.env 读取，默认单卡 0）
+export CUDA_VISIBLE_DEVICES="${SIMVLA_CUDA_DEVICES:-0}"
+NUM_PROCESSES="${SIMVLA_NUM_GPUS:-1}"
+
+VLABENCH_DATA_DIR="${SIMVLA_VLABENCH_DATA:-/root/dataset/vlabench-data/1.0.0}"
 NORM_STATS_PATH="./norm_stats/vlabench_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/vlabench_train.json"
-SMOLVLM_MODEL="/root/model/smolvlm-500M"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-/root/model/smolvlm-500M}"
 
 # =============================================================================
 # 训练超参数
@@ -66,6 +72,11 @@ KL_WARMUP_STEPS=10000
 # Latent Diffusion Model（z 空间 Flow Matching）
 LATENT_FLOW_STEPS=5
 LATENT_FM_WEIGHT=1.0
+
+# 损失函数与时间步采样（新增）
+USE_HUBER_LOSS=true
+GRIPPER_WEIGHT=5.0
+TIME_SAMPLING="logit_normal"
 
 # =============================================================================
 # Step 1: 生成训练元数据（不存在时自动创建）
@@ -117,7 +128,10 @@ ARGS="--output_dir ${OUTPUT_DIR} \
     --kl_warmup_steps ${KL_WARMUP_STEPS} \
     --use_latent_flow \
     --latent_flow_steps ${LATENT_FLOW_STEPS} \
-    --latent_fm_weight ${LATENT_FM_WEIGHT}"
+    --latent_fm_weight ${LATENT_FM_WEIGHT} \
+    --use_huber_loss \
+    --gripper_weight ${GRIPPER_WEIGHT} \
+    --time_sampling ${TIME_SAMPLING}"
 
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
@@ -139,7 +153,7 @@ echo "============================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=2 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29507 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

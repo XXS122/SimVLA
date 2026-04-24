@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import os
 
 # 1. 离线模型加载
-model_path = "/root/model/smolvlm-500M"
+model_path = os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M")
 processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
 model = AutoModel.from_pretrained(
     model_path, 

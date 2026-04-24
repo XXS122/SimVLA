@@ -169,7 +169,8 @@ def main():
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--replan-steps", type=int, default=4,
                         help="每隔多少步重新推理一次动作 chunk")
-    parser.add_argument("--save-dir", type=str, default="/root/eval_results")
+    parser.add_argument("--save-dir", type=str,
+                        default=os.environ.get("SIMVLA_EVAL_RESULTS", "/root/eval_results"))
     parser.add_argument("--metrics", nargs="+",
                         default=["success_rate", "progress_score"],
                         choices=["success_rate", "intention_score", "progress_score"])
@@ -185,7 +186,7 @@ def main():
         raise FileNotFoundError(
             f"找不到 {track_path}\n"
             f"如果是 track_5_long_horizon，请先运行：\n"
-            f"  python /root/code/VLABench/generate_track5_long_horizon.py"
+            f"  python {os.environ.get('SIMVLA_VLABENCH_CODE', '/root/code/VLABench')}/generate_track5_long_horizon.py"
         )
 
     with open(track_path) as f:

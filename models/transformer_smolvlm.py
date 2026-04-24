@@ -249,6 +249,92 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
+# --------------------------- DiTBlock with Cross-Attention to VLM ---------------------------
+
+class DiTBlockWithCrossAttn(nn.Module):
+    """
+    DiT Block with AdaLN + Cross-Attention to VLM token sequence.
+
+    相比原始 DiTBlock，新增 cross-attention 层让动作 token 直接 attend 到
+    VLM 全序列（而非仅使用 pooled 向量），使模型能关注具体视觉区域。
+
+    Cross-attention 输出层初始化为零，训练初期不干扰原有 DiT 收敛。
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        vlm_hidden_size: int,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        # 原有 DiT 组件
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            drop=0.1,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+        # Cross-Attention：动作 token → VLM token 序列
+        self.norm_cross = nn.LayerNorm(hidden_size)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            kdim=vlm_hidden_size,
+            vdim=vlm_hidden_size,
+            batch_first=True,
+            dropout=0.1,
+        )
+        # 输出层初始化为零，训练初期不干扰 DiT 收敛
+        nn.init.constant_(self.cross_attn.out_proj.weight, 0)
+        nn.init.constant_(self.cross_attn.out_proj.bias, 0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        vlm_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x            : [B, T_action, H]
+        c            : [B, H]  — AdaLN 全局条件
+        vlm_features : [B, T_vlm, D_vlm]  — VLM 全序列
+        """
+        modulation_params = self.adaLN_modulation(c)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            modulation_params.chunk(6, dim=-1)
+        )
+
+        # Self-attention with AdaLN
+        x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa.unsqueeze(1) * self.attn(x_norm)
+
+        # MLP with AdaLN
+        x_norm = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
+
+        # Cross-Attention：动作 token attend 到 VLM 全序列
+        x_norm = self.norm_cross(x)
+        x_cross, _ = self.cross_attn(query=x_norm, key=vlm_features, value=vlm_features)
+        x = x + x_cross
+
+        return x
+
+
 # --------------------------- SubgoalVAE (CVAE 子目标潜变量) ---------------------------------------
 
 class SubgoalVAE(nn.Module):
@@ -426,6 +512,7 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        use_cross_attn: bool = True,   # AdaLN 模式下是否启用 cross-attention to VLM
         use_subgoal_vae: bool = False,
         subgoal_latent_dim: int = 64,
         num_actions: int = 10,
@@ -436,13 +523,20 @@ class SmolVLMActionTransformer(nn.Module):
         self.dim_time = dim_time
         self.dim_propio = dim_propio
         self.use_adaln = use_adaln
+        self.use_cross_attn = use_cross_attn and use_adaln
         self.use_subgoal_vae = use_subgoal_vae
 
         if use_adaln:
             # ========== DiT Mode: AdaLN ==========
-            self.blocks = nn.ModuleList(
-                [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
-            )
+            if self.use_cross_attn:
+                self.blocks = nn.ModuleList([
+                    DiTBlockWithCrossAttn(hidden_size, num_heads, vlm_hidden_size, mlp_ratio=mlp_ratio)
+                    for _ in range(depth)
+                ])
+            else:
+                self.blocks = nn.ModuleList(
+                    [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
+                )
 
             # Condition encoders
             self.time_proj = nn.Sequential(
@@ -611,7 +705,10 @@ class SmolVLMActionTransformer(nn.Module):
 
         # ========== 3. DiT Blocks with AdaLN ==========
         for block in self.blocks:
-            x = block(x, c)
+            if self.use_cross_attn:
+                x = block(x, c, vlm_features)
+            else:
+                x = block(x, c)
 
         # ========== 4. Final Layer with AdaLN ==========
         return self.final_layer(x, c)
@@ -623,6 +720,7 @@ __all__ = [
     "LatentFlowNet",
     "TransformerBlock",
     "DiTBlock",
+    "DiTBlockWithCrossAttn",
     "FinalLayer",
     "Attention",
     "Mlp",

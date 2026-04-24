@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 本文件为 Claude Code 在此仓库中工作时提供指导。
 
 ## 语言要求
@@ -9,6 +11,72 @@
 ## 文档维护要求
 
 **重要：每次对话结束后，若出现了新的命令、路径、参数或操作流程，必须立即更新到本 CLAUDE.md 文档对应章节中，保持文档与实际使用一致。**
+
+## 多机器路径配置
+
+代码库通过 `paths.env` 文件管理机器特定路径，该文件已加入 `.gitignore`，不会提交到 git。
+
+### 配置方式
+
+复制模板并填入本机路径：
+```bash
+cp paths.env.example paths.env
+# 编辑 paths.env，填入本机实际路径
+```
+
+`paths.env` 中定义的环境变量：
+
+| 变量 | 用途 |
+|---|---|
+| `SIMVLA_SMOLVLM_MODEL` | SmolVLM 预训练模型路径 |
+| `SIMVLA_VLABENCH_DATA` | VLABench 数据集路径（含 .tfrecord 文件的目录） |
+| `SIMVLA_LIBERO_DATA` | LIBERO 数据集根目录（含 libero_10/goal/object/spatial 子目录） |
+| `SIMVLA_VLABENCH_CODE` | VLABench 代码库路径（评估时需要） |
+| `SIMVLA_EVAL_RESULTS` | 评估结果保存目录 |
+| `SIMVLA_CUDA_DEVICES` | 训练使用的 GPU 编号（如 `"0"` / `"0,1"` / `"0,1,2,3,4,5,6,7"`） |
+| `SIMVLA_NUM_GPUS` | 训练进程数，须与 `SIMVLA_CUDA_DEVICES` 中 GPU 数量一致 |
+
+### 当前机器路径（/datasets/...，单卡）
+```
+SIMVLA_SMOLVLM_MODEL=/datasets/models/smolvlm/SmolVLM-500M-Instruct
+SIMVLA_VLABENCH_DATA=/datasets/vlabench/data/1.0.0
+SIMVLA_VLABENCH_CODE=/datasets/code/VLABench
+SIMVLA_EVAL_RESULTS=/datasets/simvla_output/eval_results
+SIMVLA_CUDA_DEVICES=0
+SIMVLA_NUM_GPUS=1
+```
+
+### 工作原理
+- **Shell 脚本**：启动时自动 `source paths.env`，用 `${SIMVLA_XXX:-/root/fallback}` 语法，未设置时回退到原始路径
+- **Python 脚本**：argparse `default=os.environ.get("SIMVLA_XXX", "/root/fallback")`，也可手动 `source paths.env && python ...`
+
+### VLABench 项目路径配置（/datasets/code/VLABench）
+
+VLABench 项目采用相同的 `paths.env` 机制，变量前缀为 `VLABENCH_`：
+
+| 变量 | 用途 | 默认回退值 |
+|---|---|---|
+| `VLABENCH_ROOT` | VLABench 包根目录（含 configs/ tasks/ 等） | `/datasets/code/VLABench/VLABench` |
+| `VLABENCH_DATA` | 轨迹数据集保存/读取目录 | `./datasets` |
+| `VLABENCH_CUDA_DEVICES` | 使用的 GPU 编号 | `0` |
+| `VLABENCH_NUM_GPUS` | GPU 数量（用于计算进程数） | `1`（或 nvidia-smi 自动检测） |
+| `VLABENCH_PROCS_PER_GPU` | 数据生成每卡并行进程数 | `8` |
+| `VLABENCH_EVAL_PROCS_PER_GPU` | 评估每卡并行进程数 | `2` |
+| `VLABENCH_MODEL_CKPT` | 基础模型路径（evaluate_policy.py） | 空 |
+| `VLABENCH_LORA_CKPT` | LoRA checkpoint 路径 | 空 |
+| `VLABENCH_OPENVLA_LORA_CKPT` | OpenVLA LoRA checkpoint 路径 | 空 |
+
+当前机器配置（写入 `/datasets/code/VLABench/paths.env`）：
+```
+VLABENCH_ROOT=/datasets/code/VLABench/VLABench
+VLABENCH_DATA=/datasets/vlabench/datasets
+VLABENCH_CUDA_DEVICES=0
+VLABENCH_NUM_GPUS=1
+VLABENCH_PROCS_PER_GPU=8
+VLABENCH_EVAL_PROCS_PER_GPU=2
+```
+
+受影响脚本：`sh/data_generation/multi_gpu_data_generation.sh`、`sh/evaluation/example_multi_gpu_eval.sh`、`evaluate_openvla.sh`、`dataset_generation.sh`、`scripts/evaluate_policy.py`。
 
 ## 命令
 
@@ -72,7 +140,7 @@ bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal
 bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal ./simvla_output/simvla_subgoal/ckpt-10000
 ```
 
-所有训练脚本均使用 `CUDA_VISIBLE_DEVICES=6,7`（双卡 A800 80G），`--num_processes=2` DDP，`bf16` 混合精度。
+所有训练脚本均从 `paths.env` 读取 `SIMVLA_CUDA_DEVICES` 和 `SIMVLA_NUM_GPUS`，使用 `accelerate` DDP，`bf16` 混合精度。各脚本的默认回退值：`small/vlabench` 双卡（6,7）、`large` 四卡（4,5,6,7）、`subgoal` 单卡（0）。
 
 ### 评估（LIBERO - WebSocket 服务器）
 ```bash
@@ -219,6 +287,10 @@ python /root/code/SimVLA/evaluation/vlabench/evaluate_simvla.py \
 
 CVAE 子目标参数：`--use_subgoal_vae`（启用，需配合 `--use_adaln`）、`--subgoal_latent_dim 64`（潜变量维度）、`--kl_weight 0.001`（KL 权重上限）、`--kl_warmup_steps 10000`（KL annealing 步数）。
 
+损失函数与采样参数（新增）：`--use_huber_loss`（Huber loss 替代 MSE，对噪声演示更鲁棒）、`--huber_delta 1.0`（Huber delta）、`--gripper_weight 5.0`（gripper 维度损失权重倍率，建议 3~10）、`--time_sampling logit_normal|cosine|beta`（Flow Matching 时间步采样策略，默认 beta）。
+
+Cross-Attention 参数（新增）：`--use_adaln` 模式下默认启用 cross-attention（动作 token → VLM 全序列），可用 `--no_cross_attn` 禁用（消融实验用）。
+
 LDM 参数：`--use_latent_flow`（启用 z 空间 Flow Matching，需配合 `--use_subgoal_vae`）、`--latent_flow_steps 5`（推理时 z 空间 Euler 积分步数）、`--latent_fm_weight 1.0`（z 空间 FM 损失权重）。
 
 ## 架构
@@ -245,7 +317,7 @@ SmolVLMVLA.forward()
 | 文件 | 作用 |
 |---|---|
 | `models/modeling_smolvlm_vla.py` | 顶层 `SmolVLMVLA(PreTrainedModel)` — VLM 前向传播、Flow Matching 训练循环、Euler 推理、FastAPI 服务 |
-| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — 两种模式：Concat（`TransformerBlock`）或 AdaLN/DiT（`DiTBlock`）。包含 `timestep_embedding`、`FinalLayer`、`SubgoalVAE`、`LatentFlowNet` |
+| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — 两种模式：Concat（`TransformerBlock`）或 AdaLN/DiT（`DiTBlock` / `DiTBlockWithCrossAttn`）。包含 `timestep_embedding`、`FinalLayer`、`SubgoalVAE`、`LatentFlowNet` |
 | `models/action_hub.py` | `LiberoJointActionSpace`、`VLABenchJointActionSpace` — 动作/状态归一化（z-score 或分位数）。通过 `@register_action` 注册 |
 | `models/configuration_smolvlm_vla.py` | HuggingFace `PretrainedConfig` 子类，通过 `save_pretrained` 序列化。含 CVAE 和 LDM 配置字段 |
 | `models/processing_smolvlm_vla.py` | `SmolVLMVLAProcessor` — 封装 SmolVLM processor，训练时调用 `encode_language()` |
@@ -270,7 +342,7 @@ SmolVLMVLA.forward()
 
 **Concat 模式**（默认，`use_adaln=False`）：动作 token + 时间步 + 本体感知拼接后，将 VLM 特征追加到序列末尾：`x = cat([action_tokens, vlm_proj(vlm_features)], dim=1)`，仅解码动作位置。
 
-**AdaLN/DiT 模式**（`--use_adaln`）：条件 `c = time_emb + vlm_pool + proprio_emb` 通过自适应层归一化注入每个 `DiTBlock`，条件信号与主序列分离更清晰。
+**AdaLN/DiT 模式**（`--use_adaln`）：条件 `c = time_emb + vlm_pool + proprio_emb` 通过自适应层归一化注入每个 `DiTBlock`，条件信号与主序列分离更清晰。默认同时启用 `DiTBlockWithCrossAttn`，让动作 token 通过 cross-attention 直接 attend 到 VLM 全序列（而非仅 pooled 向量），显著提升视觉特征利用率。用 `--no_cross_attn` 可退回纯 AdaLN 模式（消融实验）。
 
 **CVAE 子目标模式**（`--use_adaln --use_subgoal_vae`）：在 AdaLN 条件中额外注入子目标潜变量 `z_goal ∈ R^64`。训练时从后验 `q(z | vlm, action)` 采样，推理时从先验 `p(z | vlm)` 采样。条件变为 `c = time_emb + vlm_pool + proprio_emb + subgoal_proj(z_goal)`，使模型能表示子任务的多模态分布，对长程任务阶段切换更鲁棒。
 
@@ -308,3 +380,19 @@ SmolVLMVLA.forward()
 | `steps/language_instruction` | 语言指令（每步重复，取第0步） |
 
 动作空间 `vlabench_joint`：proprio 7维（LIBERO 是8维，少一个 gripper 状态），action 7维相同。
+
+### 训练监控指标
+
+TensorBoard 日志写入 `runs/` 目录，关键指标：
+
+| 指标 | 正常范围 | 说明 |
+|---|---|---|
+| `v_loss` | 与 baseline 相近 | 动作空间 velocity loss（Flow Matching 主损失） |
+| `kl_loss` | 0.5 ~ 2.0 | 原始 KL 散度（CVAE 模式，Free Bits 每维 ≥ 0.5） |
+| `z_fm_loss` | 0.1 ~ 1.0 | z 空间 FM loss（LDM 模式） |
+| `kl_weight` | 0 → 0.001 | KL annealing 权重，前 `kl_warmup_steps` 步线性增加 |
+
+消融实验对比（三种配置）：
+- **Baseline**：`bash train_smolvlm_vlabench.sh`（无 CVAE，无 LDM）
+- **Ablation-CVAE**：加 `--use_adaln --use_subgoal_vae`（仅 CVAE）
+- **完整模型**：`bash train_smolvlm_subgoal.sh`（CVAE + LDM）

@@ -50,7 +50,8 @@ def create_vlabench_meta(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="/root/dataset/vlabench-data/1.0.0")
+    parser.add_argument("--data_dir", type=str,
+                        default=os.environ.get("SIMVLA_VLABENCH_DATA", "/root/dataset/vlabench-data/1.0.0"))
     parser.add_argument("--output", type=str, default="./datasets/metas/vlabench_train.json")
     parser.add_argument("--obs_cameras", nargs="+", default=["front", "wrist"])
     parser.add_argument("--split", type=str, default="train")

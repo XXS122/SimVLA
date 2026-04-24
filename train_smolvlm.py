@@ -19,6 +19,7 @@ import math
 import time
 import json
 import random
+import signal
 import argparse
 from pathlib import Path
 from typing import Dict
@@ -85,8 +86,8 @@ def get_args_parser():
                         help="Directory to save checkpoints")
 
     # SmolVLM backbone
-    parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="/root/model/smolvlm-500M",
+    parser.add_argument("--smolvlm_model_path", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"),
                         help="Path or HF repo for SmolVLM backbone")
     
     # Data
@@ -117,6 +118,8 @@ def get_args_parser():
 
     # System
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--gpu_mem_threshold", type=float, default=80.0,
+                        help="GPU 显存使用率阈值（%%），超过则保存 checkpoint 并退出（0 表示禁用）")
     
     # Action mode
     parser.add_argument("--action_mode", type=str, default="galaxea_joint",
@@ -145,6 +148,8 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
+    parser.add_argument("--no_cross_attn", action="store_true", default=False,
+                        help="AdaLN 模式下禁用 cross-attention to VLM（消融实验用）")
 
     # CVAE 子目标潜变量
     parser.add_argument("--use_subgoal_vae", action="store_true", default=False,
@@ -163,6 +168,19 @@ def get_args_parser():
                         help="推理时 z 空间 Euler 积分步数")
     parser.add_argument("--latent_fm_weight", type=float, default=1.0,
                         help="latent FM 损失权重")
+
+    # 损失函数
+    parser.add_argument("--use_huber_loss", action="store_true", default=False,
+                        help="使用 Huber loss 替代 MSE（对噪声演示更鲁棒）")
+    parser.add_argument("--huber_delta", type=float, default=1.0,
+                        help="Huber loss 的 delta 参数")
+    parser.add_argument("--gripper_weight", type=float, default=1.0,
+                        help="gripper 维度损失权重倍率（建议 3.0~10.0）")
+
+    # 时间步采样策略
+    parser.add_argument("--time_sampling", type=str, default="beta",
+                        choices=["beta", "logit_normal", "cosine"],
+                        help="Flow Matching 时间步采样策略")
     
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
@@ -178,7 +196,32 @@ def get_args_parser():
 # ============================================================
 # Utilities
 # ============================================================
-def set_seed(seed: int):
+def get_gpu_memory_usage_pct() -> float:
+    """返回当前进程所在 GPU 的显存使用率（0~100）。"""
+    if not torch.cuda.is_available():
+        return 0.0
+    allocated = torch.cuda.memory_allocated()
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    return allocated / total * 100.0
+
+
+def emergency_save(model, output_dir, global_step, accelerator, logger, reason="gpu_oom"):
+    """紧急保存 checkpoint 并退出。"""
+    if accelerator.is_main_process:
+        save_dir = os.path.join(output_dir, f"ckpt-{global_step}-{reason}")
+        logger.warning(f"⚠️  {reason.upper()} — 紧急保存 checkpoint 到 {save_dir}")
+        try:
+            accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+            with open(os.path.join(save_dir, "state.json"), "w") as f:
+                json.dump({"global_step": global_step, "reason": reason}, f)
+            logger.warning(f"✅ 紧急 checkpoint 已保存，正在退出...")
+        except Exception as e:
+            logger.error(f"紧急保存失败: {e}")
+    accelerator.wait_for_everyone()
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -358,6 +401,7 @@ def main(args):
             action_mode=args.action_mode,
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
+            use_cross_attn=not args.no_cross_attn,
             image_size=args.image_size,
             use_subgoal_vae=args.use_subgoal_vae,
             subgoal_latent_dim=args.subgoal_latent_dim,
@@ -365,6 +409,10 @@ def main(args):
             use_latent_flow=args.use_latent_flow,
             latent_flow_steps=args.latent_flow_steps,
             latent_fm_weight=args.latent_fm_weight,
+            use_huber_loss=args.use_huber_loss,
+            huber_delta=args.huber_delta,
+            gripper_weight=args.gripper_weight,
+            time_sampling=args.time_sampling,
         )
         model = SmolVLMVLA(config)
         
@@ -442,6 +490,15 @@ def main(args):
 
         # Logging
         if global_step % args.log_interval == 0:
+            # GPU 显存监控
+            if args.gpu_mem_threshold > 0:
+                gpu_pct = get_gpu_memory_usage_pct()
+                if gpu_pct >= args.gpu_mem_threshold:
+                    logger.warning(
+                        f"GPU 显存使用率 {gpu_pct:.1f}% >= 阈值 {args.gpu_mem_threshold}%，触发紧急保存"
+                    )
+                    emergency_save(model, output_dir, global_step, accelerator, logger, reason="gpu_oom")
+
             logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
             logs["loss_total"] = float(loss.detach().item())
             logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
@@ -466,6 +523,7 @@ def main(args):
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} "
+                    f"gpu={get_gpu_memory_usage_pct():.0f}% "
                     f"({dt:.2f}s/it)"
                 )
                 logger.info(log_str)
