@@ -145,12 +145,25 @@ bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal ./simvla_out
 ### 评估（LIBERO - WebSocket 服务器）
 ```bash
 cd evaluation/libero
-# 启动推理服务器
+# 终端1：启动推理服务器（simvla 环境）
 python serve_smolvlm_libero.py \
     --checkpoint /path/to/checkpoint \
     --norm_stats /path/to/libero_norm.json \
     --smolvlm_model /path/to/SmolVLM-500M-Instruct \
     --port 8000
+
+# 终端2：运行评估客户端（需先安装 LIBERO，见 evaluation/libero/README.md）
+# task_suite 可选：libero_spatial, libero_object, libero_goal, libero_10
+CUDA_VISIBLE_DEVICES=0 python libero_client.py \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --client_type websocket \
+    --task_suite libero_object \
+    --num_trials 50 \
+    --video_out ./eval_output
+
+# 或使用 run_eval_all.sh 自动化（参数：port num_trials output_prefix "gpu_ids"）
+bash run_eval_all.sh 8000 50 eval_simvla "0"
 ```
 
 ### 评估（VLABench）
@@ -336,7 +349,18 @@ SmolVLMVLA.forward()
 | `/root/code/VLABench/generate_track5_long_horizon.py` | 生成 track_5_long_horizon.json（7个长期任务，每任务50 episode），在 vlabench 环境下运行 |
 | `evaluation/libero/serve_smolvlm_libero.py` | LIBERO WebSocket 推理服务器（msgpack_numpy 序列化） |
 | `evaluation/vlabench/serve_smolvlm_vlabench.py` | VLABench WebSocket 推理服务器，含 quat→axis_angle 状态转换 |
+| `evaluation/libero/libero_client.py` | LIBERO 评估客户端（WebSocket），搭配 `serve_smolvlm_libero.py` 使用 |
 | `evaluation/vlabench/evaluate_simvla.py` | VLABench 评估客户端，复用 OpenPiPolicy 协议，支持全部6个 track |
+| `read_rlds.py` | RLDS TFRecord 数据格式调试工具，可用于验证数据读取 |
+| `data_process/view_data.py` | 数据可视化工具，用于检查 HDF5 轨迹图像和动作 |
+
+### 设计文档
+
+| 文件 | 内容 |
+|---|---|
+| `docs/simvla_architecture.md` | 完整架构图（Mermaid）和各模块说明 |
+| `docs/subgoal_vae_design.md` | SubgoalVAE + LatentFlow 设计细节，含 KL annealing 策略 |
+| `docs/pi0_comparison_experiment.md` | 与 Pi0 基线的对比实验设计 |
 
 ### 动作 Transformer 模式
 
@@ -383,7 +407,9 @@ SmolVLMVLA.forward()
 
 ### 训练监控指标
 
-TensorBoard 日志写入 `runs/` 目录，关键指标：
+TensorBoard 日志写入 `runs/` 目录，查看命令：`tensorboard --logdir runs/`
+
+关键指标：
 
 | 指标 | 正常范围 | 说明 |
 |---|---|---|
