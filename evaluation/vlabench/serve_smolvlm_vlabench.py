@@ -44,6 +44,14 @@ model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# 每个 WebSocket 连接对应一个 episode，维护各自的 GRU 历史状态
+# key: connection_id（用 id(websocket) 标识），value: h_state Tensor [1, history_hidden]
+_episode_h_states: dict = {}
+# 每个 episode 的 EE 位移历史，用于卡住检测
+_episode_ee_history: dict = {}
+_STUCK_THRESHOLD = 0.005  # EE 位移低于此值视为卡住
+_STUCK_STEPS = 5          # 连续卡住步数触发 reset
+
 CONFIG = {
     "state_dim": 7,
     "action_dim": 7,
@@ -122,7 +130,7 @@ def preprocess_images(front: np.ndarray, wrist: np.ndarray):
 
 # ── 推理 ──────────────────────────────────────────────────────────────────────
 
-def infer(obs: Dict[str, Any]) -> Dict[str, Any]:
+def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
     front = obs["observation/image"]
     wrist = obs["observation/wrist_image"]
     state = np.array(obs.get("observation/state", np.zeros(7)), dtype=np.float32)
@@ -134,7 +142,6 @@ def infer(obs: Dict[str, Any]) -> Dict[str, Any]:
         from scipy.spatial.transform import Rotation as R
         pos = state[:3]
         quat = state[3:7]  # xyzw
-        # 转 axis-angle
         try:
             aa = R.from_quat(quat).as_rotvec().astype(np.float32)
         except Exception:
@@ -152,21 +159,52 @@ def infer(obs: Dict[str, Any]) -> Dict[str, Any]:
 
     proprio = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
+    # 获取当前 episode 的 GRU 历史状态
+    h_state = _episode_h_states.get(conn_id, None)
+
+    # 卡住检测：若连续多步 EE 位移过小，重置 GRU
+    ee_hist = _episode_ee_history.get(conn_id, [])
+    if len(ee_hist) >= 1:
+        disp = float(np.linalg.norm(state[:3] - ee_hist[-1][:3]))
+        if disp < _STUCK_THRESHOLD:
+            ee_hist.append(state.copy())
+            if len(ee_hist) >= _STUCK_STEPS and all(
+                np.linalg.norm(ee_hist[-i][:3] - ee_hist[-i-1][:3]) < _STUCK_THRESHOLD
+                for i in range(1, _STUCK_STEPS)
+            ):
+                logger.warning(f"[conn {conn_id}] 检测到机器人卡住，重置 GRU 历史状态")
+                h_state = None
+                ee_hist = []
+        else:
+            ee_hist = [state.copy()]  # 有效移动，重置计数
+    else:
+        ee_hist = [state.copy()]
+    _episode_ee_history[conn_id] = ee_hist[-max(1, _STUCK_STEPS):]
+
     with torch.no_grad():
-        actions = model.generate_actions(
+        actions, new_h = model.generate_actions(
             input_ids=lang["input_ids"],
             image_input=images,
             image_mask=image_mask,
             proprio=proprio,
             steps=CONFIG["action_horizon"],
+            h_state=h_state,
         )
+
+    # 更新 GRU 隐状态
+    if new_h is not None:
+        _episode_h_states[conn_id] = new_h
 
     return {"actions": actions.cpu().numpy()[0]}  # [T, 7]
 
 # ── WebSocket 服务 ────────────────────────────────────────────────────────────
 
 async def handle_connection(websocket, path=None):
-    logger.info(f"连接来自 {websocket.remote_address}")
+    conn_id = id(websocket)
+    logger.info(f"连接来自 {websocket.remote_address} (id={conn_id})")
+    # 新连接对应新 episode，初始化历史状态
+    _episode_h_states.pop(conn_id, None)
+    _episode_ee_history.pop(conn_id, None)
     try:
         metadata = {
             "model": "SimVLA-VLABench",
@@ -179,7 +217,7 @@ async def handle_connection(websocket, path=None):
         async for message in websocket:
             try:
                 request = unpackb(message)
-                result = infer(request)
+                result = infer(request, conn_id)
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
@@ -192,7 +230,10 @@ async def handle_connection(websocket, path=None):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        logger.info(f"连接关闭 {websocket.remote_address}")
+        # 连接关闭时清理 episode 状态，防止内存泄漏
+        _episode_h_states.pop(conn_id, None)
+        _episode_ee_history.pop(conn_id, None)
+        logger.info(f"连接关闭 {websocket.remote_address} (id={conn_id})")
 
 
 async def serve(host: str, port: int):

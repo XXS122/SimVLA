@@ -62,6 +62,7 @@ class VLABenchRLDSHandler(DomainHandler):
         image_aug=None,
         action_mode: str = "vlabench_joint",
         lang_aug_map: dict | None = None,
+        history_seq_len: int = 1,
         **kwargs,
     ) -> Iterable[dict]:
         """遍历单个 shard 中的所有 episode。"""
@@ -78,6 +79,7 @@ class VLABenchRLDSHandler(DomainHandler):
                     training=training,
                     image_aug=image_aug,
                     lang_aug_map=lang_aug_map,
+                    history_seq_len=history_seq_len,
                 )
             except Exception as e:
                 print(f"[VLABenchRLDSHandler] 跳过损坏 episode in {shard_path}: {e}")
@@ -95,6 +97,7 @@ class VLABenchRLDSHandler(DomainHandler):
         training: bool,
         image_aug,
         lang_aug_map: dict | None,
+        history_seq_len: int = 1,
     ) -> Iterable[dict]:
         import tensorflow as tf
 
@@ -160,13 +163,74 @@ class VLABenchRLDSHandler(DomainHandler):
 
             image_input = torch.stack(imgs, dim=0)  # [V, C, H, W]
 
-            yield {
+            sample = {
                 "language_instruction": instruction,
                 "image_input": image_input,
                 "image_mask": image_mask,
                 "proprio": torch.tensor(proprio[idx], dtype=torch.float32),
                 "abs_trajectory": torch.tensor(chunk, dtype=torch.float32),
             }
+
+            # 历史本体感知序列 [K, 7]：以当前帧为终点往前 K 帧，不足时补零
+            if history_seq_len > 1:
+                K = history_seq_len
+                hist = np.zeros((K, proprio.shape[1]), dtype=np.float32)
+                for k in range(K):
+                    src = idx - (K - 1 - k)
+                    if src >= 0:
+                        hist[k] = proprio[src]
+                    # else: 保持零填充
+                sample["proprio_sequence"] = torch.tensor(hist, dtype=torch.float32)
+
+            # 弱监督物理谓词标签 [5]
+            sample["physics_labels"] = self._compute_physics_labels(chunk, proprio[idx])
+
+            # 弱监督 gripper 切换剩余步比例标签 [1]
+            sample["switch_labels"] = self._compute_switch_label(actions, idx, num_actions)
+
+            yield sample
+
+    @staticmethod
+    def _compute_physics_labels(chunk: np.ndarray, proprio_cur: np.ndarray) -> torch.Tensor:
+        """
+        从动作 chunk 和当前本体感知自动抽取 5 个物理谓词代理标签（弱监督）。
+
+        谓词定义（均归一化到 [0, 1]）：
+          0 gripper_active  : chunk[1:, 6].mean() > 0.05（gripper 正在关闭）
+          1 high_rotation   : |chunk[1:, 3:6]|.mean() > 0.05（大幅旋转，潜在碰撞风险）
+          2 z_height        : sigmoid(proprio[2] * 5)（末端 Z 坐标高度）
+          3 moving_up       : chunk[1:, 2].mean() > 0.01（末端向上运动）
+          4 stable_traj     : std(chunk[1:, :3]) < 0.02（轨迹平稳）
+        """
+        action_chunk = chunk[1:]  # [T, 7]，去掉索引0（当前状态）
+        labels = np.array([
+            float(action_chunk[:, 6].mean() > 0.05),
+            float(np.abs(action_chunk[:, 3:6]).mean() > 0.05),
+            float(1.0 / (1.0 + np.exp(-proprio_cur[2] * 5.0))),  # sigmoid(z*5)
+            float(action_chunk[:, 2].mean() > 0.01),
+            float(np.std(action_chunk[:, :3]) < 0.02),
+        ], dtype=np.float32)
+        return torch.tensor(labels, dtype=torch.float32)
+
+    @staticmethod
+    def _compute_switch_label(
+        actions: np.ndarray, idx: int, num_actions: int
+    ) -> torch.Tensor:
+        """
+        计算距离下次 gripper 状态切换的剩余步数比例（[0, 1]）。
+
+        若 gripper 在未来 N 步内切换，比例 = 切换步 / num_actions；
+        若不切换，标签为 1.0（很远）。
+        """
+        T = actions.shape[0]
+        cur_gripper = actions[idx, 6]
+        steps_until = num_actions  # 默认"不切换"
+        for k in range(1, min(num_actions, T - idx)):
+            if abs(actions[idx + k, 6] - cur_gripper) > 0.1:
+                steps_until = k
+                break
+        ratio = float(steps_until) / float(num_actions)
+        return torch.tensor([ratio], dtype=torch.float32)  # [1]，collate 后为 [B, 1]
 
     @staticmethod
     def _decode_image(frame_bytes: Optional[bytes]) -> Image.Image:

@@ -49,20 +49,22 @@ class SmolVLMDataReader(IterableDataset):
     IMAGE_STD = (0.229, 0.224, 0.225)
     
     def __init__(
-        self, 
-        metas_path: str, 
-        num_actions: int = 10, 
-        num_views: int = 3, 
+        self,
+        metas_path: str,
+        num_actions: int = 10,
+        num_views: int = 3,
         training: bool = True,
         action_mode: str = "galaxea_joint",
         lang_aug: str = None,
-        image_size: int = 384,  # Default 384, can be 384 or 512
+        image_size: int = 384,
+        history_seq_len: int = 1,  # K 帧历史（1 = 无历史，等同于旧行为）
     ):
         self.num_views = num_views
         self.training = training
         self.num_actions = num_actions
         self.action_mode = action_mode
         self.image_size = image_size
+        self.history_seq_len = history_seq_len
         self.metas: Dict[str, dict] = {}
         
         print(f"[SmolVLM Dataset] Image size: {self.image_size}x{self.image_size}")
@@ -153,7 +155,8 @@ class SmolVLMDataReader(IterableDataset):
                     training=self.training,
                     image_aug=self.image_aug,
                     lang_aug_map=meta.get("lang_aug_map"),
-                    action_mode=self.action_mode
+                    action_mode=self.action_mode,
+                    history_seq_len=self.history_seq_len,
                 ):
                     idx_for_delta = meta.get("idx_for_delta", [])
                     has_proprio = "proprio" in sample
@@ -281,14 +284,15 @@ class SmolVLMDataReaderWithPadding(SmolVLMDataReader):
 
 
 def create_smolvlm_dataloader(
-    batch_size: int, 
-    metas_path: str, 
+    batch_size: int,
+    metas_path: str,
     num_actions: int,
     training: bool,
     action_mode: str,
     num_workers: int = 4,
     image_size: int = 384,
     use_smart_padding: bool = False,
+    history_seq_len: int = 1,
 ):
     """
     Create dataloader for SmolVLM-VLA training.
@@ -349,6 +353,7 @@ def create_smolvlm_dataloader(
         training=training,
         action_mode=action_mode,
         image_size=image_size,
+        history_seq_len=history_seq_len,
     )
     
     return DataLoader(

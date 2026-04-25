@@ -182,7 +182,23 @@ def get_args_parser():
     parser.add_argument("--time_sampling", type=str, default="beta",
                         choices=["beta", "logit_normal", "cosine"],
                         help="Flow Matching 时间步采样策略")
-    
+
+    # HistoryEncoder（GRU 历史感知）
+    parser.add_argument("--use_history_encoder", action="store_true", default=False,
+                        help="启用 GRU 历史感知（需配合 --use_adaln）")
+    parser.add_argument("--history_hidden", type=int, default=128,
+                        help="GRU 隐状态维度")
+    parser.add_argument("--history_seq_len", type=int, default=4,
+                        help="训练时使用的连续历史帧数（含当前帧）")
+    parser.add_argument("--switch_loss_weight", type=float, default=0.05,
+                        help="gripper 阶段切换辅助损失权重")
+
+    # PhysicsPredicateDecoder（物理谓词嵌入）
+    parser.add_argument("--use_physics_cot", action="store_true", default=False,
+                        help="启用弱监督物理谓词嵌入（需配合 --use_adaln）")
+    parser.add_argument("--physics_weight", type=float, default=0.01,
+                        help="物理谓词辅助损失权重")
+
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
                         help="Hidden size for action transformer")
@@ -414,6 +430,12 @@ def main(args):
             huber_delta=args.huber_delta,
             gripper_weight=args.gripper_weight,
             time_sampling=args.time_sampling,
+            use_history_encoder=args.use_history_encoder,
+            history_hidden=args.history_hidden,
+            history_seq_len=args.history_seq_len,
+            switch_loss_weight=args.switch_loss_weight,
+            use_physics_cot=args.use_physics_cot,
+            physics_weight=args.physics_weight,
         )
         model = SmolVLMVLA(config)
         
@@ -432,6 +454,7 @@ def main(args):
         training=True,
         num_workers=args.num_workers,
         image_size=args.image_size,
+        history_seq_len=args.history_seq_len,
     )
 
     # Optimizer

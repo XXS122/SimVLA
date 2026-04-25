@@ -138,6 +138,26 @@ bash train_smolvlm_subgoal.sh [batch_size] [learning_coef] [output_dir] [resume_
 bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal
 # 从断点续训：
 bash train_smolvlm_subgoal.sh 32 0.1 ./simvla_output/simvla_subgoal ./simvla_output/simvla_subgoal/ckpt-10000
+
+# HiPhys-VLA 训练（HistoryEncoder + PhysicsPredicateDecoder，均需配合 --use_adaln）
+# 仅 PhysCoT（物理谓词嵌入，track_3）：
+python train_smolvlm.py \
+    --train_metas_path ./datasets/metas/vlabench_train.json \
+    --use_adaln --use_physics_cot --physics_weight 0.01 \
+    --batch_size 16 --output_dir ./simvla_output/simvla_physics
+
+# 仅 HistoryEncoder（GRU 历史感知，track_5）：
+python train_smolvlm.py \
+    --train_metas_path ./datasets/metas/vlabench_train.json \
+    --use_adaln --use_history_encoder --history_seq_len 4 --switch_loss_weight 0.05 \
+    --batch_size 16 --output_dir ./simvla_output/simvla_history
+
+# HiPhys-VLA 完整（两者合并，track_3 + track_5）：
+python train_smolvlm.py \
+    --train_metas_path ./datasets/metas/vlabench_train.json \
+    --use_adaln --use_physics_cot --use_history_encoder --history_seq_len 4 \
+    --physics_weight 0.01 --switch_loss_weight 0.05 \
+    --batch_size 16 --output_dir ./simvla_output/simvla_hiphys
 ```
 
 所有训练脚本均从 `paths.env` 读取 `SIMVLA_CUDA_DEVICES` 和 `SIMVLA_NUM_GPUS`，使用 `accelerate` DDP，`bf16` 混合精度。各脚本的默认回退值：`small/vlabench` 双卡（6,7）、`large` 四卡（4,5,6,7）、`subgoal` 单卡（0）。
@@ -330,7 +350,7 @@ SmolVLMVLA.forward()
 | 文件 | 作用 |
 |---|---|
 | `models/modeling_smolvlm_vla.py` | 顶层 `SmolVLMVLA(PreTrainedModel)` — VLM 前向传播、Flow Matching 训练循环、Euler 推理、FastAPI 服务 |
-| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — 两种模式：Concat（`TransformerBlock`）或 AdaLN/DiT（`DiTBlock` / `DiTBlockWithCrossAttn`）。包含 `timestep_embedding`、`FinalLayer`、`SubgoalVAE`、`LatentFlowNet` |
+| `models/transformer_smolvlm.py` | `SmolVLMActionTransformer` — 两种模式：Concat（`TransformerBlock`）或 AdaLN/DiT（`DiTBlock` / `DiTBlockWithCrossAttn`）。包含 `timestep_embedding`、`FinalLayer`、`SubgoalVAE`、`LatentFlowNet`、`HistoryEncoder`（GRU 历史感知）、`PhysicsPredicateDecoder`（物理谓词嵌入） |
 | `models/action_hub.py` | `LiberoJointActionSpace`、`VLABenchJointActionSpace` — 动作/状态归一化（z-score 或分位数）。通过 `@register_action` 注册 |
 | `models/configuration_smolvlm_vla.py` | HuggingFace `PretrainedConfig` 子类，通过 `save_pretrained` 序列化。含 CVAE 和 LDM 配置字段 |
 | `models/processing_smolvlm_vla.py` | `SmolVLMVLAProcessor` — 封装 SmolVLM processor，训练时调用 `encode_language()` |

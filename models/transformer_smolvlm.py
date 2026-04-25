@@ -600,25 +600,32 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
-        z_goal: torch.Tensor | None = None,  # [B, latent_dim] - 子目标潜变量（可选）
+        z_goal: torch.Tensor | None = None,       # [B, latent_dim] - 子目标潜变量（可选）
+        h_cond: torch.Tensor | None = None,       # [B, H] - 历史 GRU 条件（可选）
+        physics_cond: torch.Tensor | None = None, # [B, H] - 物理谓词条件（可选）
     ) -> torch.Tensor:
         """
         Forward pass for SmolVLM Action Transformer.
 
         Inputs
         ------
-        vlm_features : [B, T_vlm, D] - Unified features from SmolVLM (all views processed together)
+        vlm_features      : [B, T_vlm, D]
         action_with_noise : [B, T_action, dim_action]
-        proprio : [B, dim_proprio]
-        t : [B]
-        z_goal : [B, latent_dim] - 子目标潜变量，仅 AdaLN 模式使用（可选）
+        proprio           : [B, dim_proprio]
+        t                 : [B]
+        z_goal            : [B, latent_dim]  — 子目标潜变量，仅 AdaLN 使用（可选）
+        h_cond            : [B, H]           — 历史 GRU 投影条件，仅 AdaLN 使用（可选）
+        physics_cond      : [B, H]           — 物理谓词投影条件，仅 AdaLN 使用（可选）
 
         Returns
         -------
         Tensor: Predicted velocity, [B, T_action, dim_action]
         """
         if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t, z_goal=z_goal)
+            return self._forward_adaln(
+                vlm_features, action_with_noise, proprio, t,
+                z_goal=z_goal, h_cond=h_cond, physics_cond=physics_cond,
+            )
         else:
             return self._forward_concat(vlm_features, action_with_noise, proprio, t)
     
@@ -670,11 +677,13 @@ class SmolVLMActionTransformer(nn.Module):
         proprio: torch.Tensor,
         t: torch.Tensor,
         z_goal: torch.Tensor | None = None,
+        h_cond: torch.Tensor | None = None,       # [B, H]：历史 GRU 条件
+        physics_cond: torch.Tensor | None = None, # [B, H]：物理谓词条件
     ) -> torch.Tensor:
         """
         DiT/AdaLN mode forward pass.
 
-        Conditions (time, vlm, proprio, z_goal) injected via AdaLN.
+        Conditions (time, vlm, proprio, z_goal, h_cond, physics_cond) injected via AdaLN.
         No aux_visual needed for SmolVLM.
         """
         B, num_actions = action_with_noise.shape[:2]
@@ -697,6 +706,14 @@ class SmolVLMActionTransformer(nn.Module):
         if z_goal is not None and self.use_subgoal_vae:
             c = c + self.subgoal_proj(z_goal)  # [B, H]
 
+        # 历史 GRU 条件（若启用）
+        if h_cond is not None:
+            c = c + h_cond  # [B, H]
+
+        # 物理谓词条件（若启用）
+        if physics_cond is not None:
+            c = c + physics_cond  # [B, H]
+
         # ========== 2. Encode action sequence ==========
         x = self.action_encoder(action_with_noise)  # [B, T_action, H]
 
@@ -714,10 +731,109 @@ class SmolVLMActionTransformer(nn.Module):
         return self.final_layer(x, c)
 
 
+# --------------------------- HistoryEncoder（GRU 历史感知）-------------------------------
+
+class HistoryEncoder(nn.Module):
+    """
+    轻量级 GRU，将连续帧的本体感知序列编码为历史状态向量。
+
+    推理时跨 generate_actions() 调用持久化隐状态，使模型感知长程任务阶段。
+    训练时以 K 帧 proprio 序列更新 GRU，最终隐状态注入 AdaLN 条件向量 c。
+    """
+
+    def __init__(self, proprio_dim: int = 7, hidden_size: int = 128, adaln_hidden: int = 768) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.gru = nn.GRUCell(input_size=proprio_dim, hidden_size=hidden_size)
+        self.h_norm = nn.LayerNorm(hidden_size)
+        self.h_proj = nn.Linear(hidden_size, adaln_hidden)
+        # 辅助任务：预测距离下次 gripper 切换的剩余步数比例（0~1）
+        self.switch_pred = nn.Linear(hidden_size, 1)
+
+        # h_proj 初始化为零，训练初期不干扰主干损失
+        nn.init.constant_(self.h_proj.weight, 0)
+        nn.init.constant_(self.h_proj.bias, 0)
+
+    def forward(
+        self,
+        proprio_sequence: torch.Tensor,  # [B, K, proprio_dim]
+        h_init: torch.Tensor | None = None,  # [B, hidden_size] 或 None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        proprio_sequence : [B, K, proprio_dim]
+            K 帧连续本体感知序列（含当前帧）
+        h_init : [B, hidden_size] | None
+            跨步长持久化的隐状态（推理时传入）
+
+        Returns
+        -------
+        h_t : [B, hidden_size]   — 最终隐状态
+        cond : [B, adaln_hidden] — 投影后的条件向量（注入 c）
+        """
+        B, K, D = proprio_sequence.shape
+        h = h_init if h_init is not None else torch.zeros(B, self.hidden_size,
+                                                           device=proprio_sequence.device,
+                                                           dtype=proprio_sequence.dtype)
+        for k in range(K):
+            h = self.gru(proprio_sequence[:, k], h)
+
+        cond = self.h_proj(self.h_norm(h))  # [B, adaln_hidden]
+        return h, cond
+
+
+# --------------------------- PhysicsPredicateDecoder（物理谓词嵌入）-------------------------------
+
+class PhysicsPredicateDecoder(nn.Module):
+    """
+    轻量 MLP，从 vlm_pooled 解码 5 个物理谓词（弱监督）。
+
+    谓词：[gripper_active, high_rotation, z_height, moving_up, stable_traj]
+    解码结果同时用于辅助分类/回归损失（弱监督），并以可微嵌入注入 AdaLN 条件向量 c。
+    """
+
+    NUM_PREDICATES: int = 5
+
+    def __init__(self, vlm_hidden: int = 576, adaln_hidden: int = 768) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(vlm_hidden, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, self.NUM_PREDICATES),
+        )
+        self.physics_proj = nn.Linear(self.NUM_PREDICATES, adaln_hidden)
+
+        # 输出层初始化为零，训练初期不影响主干
+        nn.init.constant_(self.mlp[-1].weight, 0)
+        nn.init.constant_(self.mlp[-1].bias, 0)
+        nn.init.constant_(self.physics_proj.weight, 0)
+        nn.init.constant_(self.physics_proj.bias, 0)
+
+    def forward(self, vlm_pooled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        vlm_pooled : [B, vlm_hidden]
+
+        Returns
+        -------
+        pred_logits : [B, NUM_PREDICATES]  — 原始 logits（前4维 sigmoid，第3维线性）
+        cond        : [B, adaln_hidden]    — 投影后的条件向量（注入 c）
+        """
+        pred_logits = self.mlp(vlm_pooled)   # [B, 5]
+        cond = self.physics_proj(torch.sigmoid(pred_logits))  # [B, adaln_hidden]
+        return pred_logits, cond
+
+
 __all__ = [
     "SmolVLMActionTransformer",
     "SubgoalVAE",
     "LatentFlowNet",
+    "HistoryEncoder",
+    "PhysicsPredicateDecoder",
     "TransformerBlock",
     "DiTBlock",
     "DiTBlockWithCrossAttn",

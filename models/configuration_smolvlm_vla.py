@@ -71,6 +71,16 @@ class SmolVLMVLAConfig(PretrainedConfig):
         # === 时间步采样策略 ===
         time_sampling: str = 'beta',     # 'beta' | 'logit_normal' | 'cosine'
 
+        # === HistoryEncoder（GRU 历史感知）===
+        use_history_encoder: bool = False,
+        history_hidden: int = 128,       # GRU 隐状态维度
+        history_seq_len: int = 4,        # 训练时使用的连续帧数（含当前帧）
+        switch_loss_weight: float = 0.05, # 阶段切换辅助损失权重
+
+        # === PhysicsPredicateDecoder（物理谓词嵌入）===
+        use_physics_cot: bool = False,
+        physics_weight: float = 0.01,    # 物理谓词辅助损失权重
+
         **kwargs,
     ):
         # SmolVLM backbone path
@@ -114,6 +124,16 @@ class SmolVLMVLAConfig(PretrainedConfig):
 
         # 时间步采样策略
         self.time_sampling = time_sampling
+
+        # HistoryEncoder
+        self.use_history_encoder = use_history_encoder
+        self.history_hidden = history_hidden
+        self.history_seq_len = history_seq_len
+        self.switch_loss_weight = switch_loss_weight
+
+        # PhysicsPredicateDecoder
+        self.use_physics_cot = use_physics_cot
+        self.physics_weight = physics_weight
 
         # Initialize base HF config attributes
         super().__init__(**kwargs)

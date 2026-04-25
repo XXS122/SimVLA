@@ -29,7 +29,7 @@ import json_numpy
 import cv2
 
 from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
-from .transformer_smolvlm import SmolVLMActionTransformer
+from .transformer_smolvlm import SmolVLMActionTransformer, HistoryEncoder, PhysicsPredicateDecoder
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
 
@@ -104,6 +104,28 @@ class SmolVLMVLA(PreTrainedModel):
 
         # 时间步采样策略
         self.time_sampling = getattr(config, 'time_sampling', 'beta')
+
+        # HistoryEncoder（GRU 历史感知）
+        self.use_history_encoder = getattr(config, 'use_history_encoder', False)
+        self.history_seq_len = getattr(config, 'history_seq_len', 4)
+        self.switch_loss_weight = getattr(config, 'switch_loss_weight', 0.05)
+        if self.use_history_encoder:
+            self.history_encoder = HistoryEncoder(
+                proprio_dim=dim_proprio,
+                hidden_size=getattr(config, 'history_hidden', 128),
+                adaln_hidden=config.hidden_size,
+            )
+            logging.info(f"✓ HistoryEncoder enabled: GRU hidden={getattr(config,'history_hidden',128)}, K={self.history_seq_len}")
+
+        # PhysicsPredicateDecoder（物理谓词嵌入）
+        self.use_physics_cot = getattr(config, 'use_physics_cot', False)
+        self.physics_weight = getattr(config, 'physics_weight', 0.01)
+        if self.use_physics_cot:
+            self.physics_decoder = PhysicsPredicateDecoder(
+                vlm_hidden=vlm_hidden_size,
+                adaln_hidden=config.hidden_size,
+            )
+            logging.info(f"✓ PhysicsPredicateDecoder enabled: weight={self.physics_weight}")
 
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
@@ -351,19 +373,23 @@ class SmolVLMVLA(PreTrainedModel):
     # ================================= training =================================
     def forward(
         self,
-        input_ids: torch.LongTensor,        # [B, L] - tokenized language instruction
-        image_input: torch.FloatTensor,     # [B, V, C, H, W]
-        image_mask: torch.Tensor,           # [B, V]
-        proprio: torch.Tensor,              # [B, dim_proprio]
-        action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
+        input_ids: torch.LongTensor,              # [B, L] - tokenized language instruction
+        image_input: torch.FloatTensor,           # [B, V, C, H, W]
+        image_mask: torch.Tensor,                 # [B, V]
+        proprio: torch.Tensor,                    # [B, dim_proprio]
+        action: torch.Tensor,                     # [B, T=num_actions, D=dim_action]
+        proprio_sequence: torch.Tensor | None = None,  # [B, K, dim_proprio] 历史序列
+        physics_labels: torch.Tensor | None = None,    # [B, 5] 弱监督物理谓词标签
+        switch_labels: torch.Tensor | None = None,     # [B, 1] gripper 切换剩余步比例
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
-        
+
         1) Time sampling: t ~ Beta(1.5, 1) * 0.999 + 0.001
         2) Interpolation: x_t = t * noise + (1-t) * actions
         3) Target: velocity u_t = noise - actions
         4) Model predicts v_t, compute MSE(v_t, u_t)
+        5) (Optional) Auxiliary losses: physics predicates, GRU switch prediction
         """
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
@@ -446,6 +472,47 @@ class SmolVLMVLA(PreTrainedModel):
             # 训练时直接用后验 z_0 注入 AdaLN（不走推理积分路径）
             z_goal = z_0
 
+        # HistoryEncoder：GRU 历史感知条件
+        h_cond = None
+        switch_loss = None
+        if self.use_history_encoder and self.use_adaln:
+            if proprio_sequence is not None:
+                # 归一化历史序列
+                if hasattr(self.action_space, 'normalize_state'):
+                    B_seq, K_seq, D_seq = proprio_sequence.shape
+                    seq_flat = proprio_sequence.reshape(B_seq * K_seq, D_seq)
+                    seq_norm = self.action_space.normalize_state(seq_flat).reshape(B_seq, K_seq, D_seq)
+                elif hasattr(self.action_space, 'normalize'):
+                    B_seq, K_seq, D_seq = proprio_sequence.shape
+                    seq_flat = proprio_sequence.reshape(B_seq * K_seq, D_seq)
+                    seq_norm = self.action_space.normalize(seq_flat).reshape(B_seq, K_seq, D_seq)
+                else:
+                    seq_norm = proprio_sequence
+                h_t, h_cond = self.history_encoder(seq_norm)
+            else:
+                # 无历史时用当前帧单步更新
+                proprio_seq_single = proprio_norm.unsqueeze(1)  # [B, 1, D]
+                h_t, h_cond = self.history_encoder(proprio_seq_single)
+
+            # 辅助损失：预测 gripper 切换剩余步比例
+            if switch_labels is not None:
+                switch_pred = self.history_encoder.switch_pred(h_t)  # [B, 1]
+                switch_loss = F.huber_loss(switch_pred, switch_labels, delta=0.2)
+
+        # PhysicsPredicateDecoder：物理谓词条件
+        physics_cond = None
+        physics_loss = None
+        if self.use_physics_cot and self.use_adaln:
+            vlm_pooled = enc["vlm_features"].mean(dim=1)
+            pred_logits, physics_cond = self.physics_decoder(vlm_pooled)
+            # 辅助损失：对4个二分类谓词用 BCE，对第3维（height）用 MSE
+            if physics_labels is not None:
+                loss_binary = F.binary_cross_entropy_with_logits(
+                    pred_logits[:, [0, 1, 3, 4]], physics_labels[:, [0, 1, 3, 4]]
+                )
+                loss_height = F.mse_loss(torch.sigmoid(pred_logits[:, 2]), physics_labels[:, 2])
+                physics_loss = loss_binary + 0.1 * loss_height
+
         # Model prediction (no aux_visual_inputs for SmolVLM)
         v_t = self.transformer(
             vlm_features=enc["vlm_features"],
@@ -453,6 +520,8 @@ class SmolVLMVLA(PreTrainedModel):
             t=t,
             proprio=proprio_norm,
             z_goal=z_goal,
+            h_cond=h_cond,
+            physics_cond=physics_cond,
         )
 
         # 损失函数：Huber 或 MSE，支持 gripper 维度加权
@@ -473,6 +542,10 @@ class SmolVLMVLA(PreTrainedModel):
             loss_dict["kl_loss"] = kl_loss * self.kl_weight
         if latent_fm_loss is not None:
             loss_dict["latent_fm_loss"] = latent_fm_loss * self.latent_fm_weight
+        if switch_loss is not None:
+            loss_dict["switch_loss"] = switch_loss * self.switch_loss_weight
+        if physics_loss is not None:
+            loss_dict["physics_loss"] = physics_loss * self.physics_weight
 
         return loss_dict
 
@@ -485,15 +558,21 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
-    ) -> torch.Tensor:
+        h_state: torch.Tensor | None = None,  # [B, history_hidden] 持久化历史状态
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Flow Matching inference (Euler integration).
-        
+
         1) Initialize x_t = noise (t=1)
         2) Loop t from 1 to 0:
            - Model predicts velocity v_t
            - Euler update: x_t = x_t + dt * v_t
         3) Final x_0 ≈ target action
+
+        Returns
+        -------
+        actions  : [B, T, D]
+        new_h    : [B, history_hidden] | None  — 更新后的 GRU 隐状态，供下步传入
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
@@ -510,6 +589,19 @@ class SmolVLMVLA(PreTrainedModel):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
+
+        # HistoryEncoder：更新 GRU 隐状态
+        new_h = None
+        h_cond_infer = None
+        if self.use_history_encoder and self.use_adaln:
+            proprio_seq_single = proprio_norm.unsqueeze(1)  # [B, 1, D]
+            new_h, h_cond_infer = self.history_encoder(proprio_seq_single, h_init=h_state)
+
+        # PhysicsPredicateDecoder：物理谓词条件（推理时无监督，仅用预测值）
+        physics_cond_infer = None
+        if self.use_physics_cot and self.use_adaln:
+            vlm_pooled = enc["vlm_features"].mean(dim=1)
+            _, physics_cond_infer = self.physics_decoder(vlm_pooled)
 
         # Euler integration
         steps = max(1, int(steps))
@@ -548,12 +640,14 @@ class SmolVLMVLA(PreTrainedModel):
                 proprio=proprio_norm,
                 t=t_tensor,
                 z_goal=z_goal,
+                h_cond=h_cond_infer,
+                physics_cond=physics_cond_infer,
             )
 
             x_t = x_t + dt * v_t
             t = t + dt
 
-        return self.action_space.postprocess(x_t)
+        return self.action_space.postprocess(x_t), new_h
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
