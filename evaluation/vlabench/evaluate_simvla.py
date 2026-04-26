@@ -106,8 +106,7 @@ class SimVLAEvaluator(Evaluator):
                 if cfg.get("evaluation", {}).get("max_episode_length"):
                     max_episode_length = cfg["evaluation"]["max_episode_length"]
 
-            from tqdm import tqdm
-            for i in tqdm(range(self.n_episodes), desc=f"Evaluating {task} of {agent.name}"):
+            for i in range(self.n_episodes):
                 agent.reset()
                 # unnorm_key=None：服务器已做反归一化，不再重复
                 kwargs = {"unnorm_key": None, "max_episode_length": max_episode_length}
@@ -117,6 +116,14 @@ class SimVLAEvaluator(Evaluator):
                     else:
                         info = self.evaluate_single_episode(agent, task, i, self.episode_config[task][i], **kwargs)
                     task_infos.append(info)
+                    # 每完成一个 episode 立即打印结果
+                    success = info.get("success", False)
+                    n_done = len(task_infos)
+                    n_success_so_far = sum(x["success"] for x in task_infos)
+                    status = "✓ 成功" if success else "✗ 失败"
+                    print(f"  [{task}] episode {i+1:>2}/{self.n_episodes}  {status}  "
+                          f"累计: {n_success_so_far}/{n_done} "
+                          f"({n_success_so_far/n_done:.0%})")
                 except Exception as e:
                     print(f"[SKIP] {task} episode {i}: {e}")
                     traceback.print_exc()
