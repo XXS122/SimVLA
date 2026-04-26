@@ -773,12 +773,16 @@ class HistoryEncoder(nn.Module):
         cond : [B, adaln_hidden] — 投影后的条件向量（注入 c）
         """
         B, K, D = proprio_sequence.shape
-        h = h_init if h_init is not None else torch.zeros(B, self.hidden_size,
-                                                           device=proprio_sequence.device,
-                                                           dtype=proprio_sequence.dtype)
+        orig_dtype = proprio_sequence.dtype
+        # GRUCell 不支持 BFloat16，强制转为 float32 计算
+        x = proprio_sequence.float()
+        h = h_init.float() if h_init is not None else torch.zeros(
+            B, self.hidden_size, device=proprio_sequence.device, dtype=torch.float32
+        )
         for k in range(K):
-            h = self.gru(proprio_sequence[:, k], h)
+            h = self.gru(x[:, k], h)
 
+        h = h.to(orig_dtype)
         cond = self.h_proj(self.h_norm(h))  # [B, adaln_hidden]
         return h, cond
 
