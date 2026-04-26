@@ -558,21 +558,17 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
-        h_state: torch.Tensor | None = None,  # [B, history_hidden] 持久化历史状态
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        h_state: torch.Tensor | None = None,       # [B, history_hidden] 持久化 GRU 状态
+        z_goal_cache: torch.Tensor | None = None,  # [B, latent_dim] 持久化 SubgoalVAE 子目标
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
         Flow Matching inference (Euler integration).
 
-        1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
-        3) Final x_0 ≈ target action
-
         Returns
         -------
-        actions  : [B, T, D]
-        new_h    : [B, history_hidden] | None  — 更新后的 GRU 隐状态，供下步传入
+        actions    : [B, T, D]
+        new_h      : [B, history_hidden] | None  — 更新后的 GRU 隐状态
+        new_z_goal : [B, latent_dim] | None      — 当前子目标（供下步缓存复用）
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
@@ -610,26 +606,37 @@ class SmolVLMVLA(PreTrainedModel):
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
 
-        # 推理时生成 z_goal（固定，不随动作 Euler 步变化）
+        # SubgoalVAE：生成或复用子目标 z_goal
+        # 复用缓存可保证同一 episode 内子目标稳定，避免每步重采样导致目标跳变
         z_goal = None
+        new_z_goal = None
         if self.use_subgoal_vae and self.use_adaln:
-            vlm_pooled = enc["vlm_features"].mean(dim=1)
-            if self.use_latent_flow:
-                # LDM：从噪声 z_T 积分到 z_0（5步 Euler）
-                latent_dim = self.transformer.subgoal_vae.latent_dim
-                z_t_latent = torch.randn(B, latent_dim, device=device, dtype=dtype)
-                dt_z = -1.0 / self.latent_flow_steps
-                t_z = 1.0
-                while t_z > -dt_z / 2:
-                    t_z_tensor = torch.full((B,), t_z, device=device, dtype=dtype)
-                    v_z = self.transformer.latent_flow_net(z_t_latent, t_z_tensor, vlm_pooled)
-                    z_t_latent = z_t_latent + dt_z * v_z
-                    t_z += dt_z
-                z_goal = z_t_latent
+            if z_goal_cache is not None:
+                # 复用 episode 首步生成的 z_goal，保持目标一致性
+                z_goal = z_goal_cache.to(device=device, dtype=dtype)
             else:
-                # 退回简单先验采样
-                prior_mu, prior_log_var = self.transformer.subgoal_vae.encode_prior(vlm_pooled)
-                z_goal = self.transformer.subgoal_vae.reparameterize(prior_mu, prior_log_var)
+                vlm_pooled = enc["vlm_features"].mean(dim=1)
+                if self.use_latent_flow:
+                    # LDM：从噪声 z_T 积分到 z_0（多样本平均降低方差）
+                    latent_dim = self.transformer.subgoal_vae.latent_dim
+                    n_samples = 4  # 多样本平均降低随机性
+                    z_accum = torch.zeros(B, latent_dim, device=device, dtype=dtype)
+                    dt_z = -1.0 / self.latent_flow_steps
+                    for _ in range(n_samples):
+                        z_t_latent = torch.randn(B, latent_dim, device=device, dtype=dtype)
+                        t_z = 1.0
+                        while t_z > -dt_z / 2:
+                            t_z_tensor = torch.full((B,), t_z, device=device, dtype=dtype)
+                            v_z = self.transformer.latent_flow_net(z_t_latent, t_z_tensor, vlm_pooled)
+                            z_t_latent = z_t_latent + dt_z * v_z
+                            t_z += dt_z
+                        z_accum = z_accum + z_t_latent
+                    z_goal = z_accum / n_samples
+                else:
+                    # 直接使用先验均值，不加噪声（推理时确定性更好）
+                    prior_mu, _ = self.transformer.subgoal_vae.encode_prior(vlm_pooled)
+                    z_goal = prior_mu
+            new_z_goal = z_goal
 
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
@@ -647,7 +654,7 @@ class SmolVLMVLA(PreTrainedModel):
             x_t = x_t + dt * v_t
             t = t + dt
 
-        return self.action_space.postprocess(x_t), new_h
+        return self.action_space.postprocess(x_t), new_h, new_z_goal
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
@@ -699,9 +706,9 @@ class SmolVLMVLA(PreTrainedModel):
                 inputs = {k: to_model(v) for k, v in inputs.items()}
                 inputs["proprio"] = to_model(proprio.unsqueeze(0))
 
-                # Inference
+                # Inference (generate_actions 返回三元组，取第一项)
                 steps = int(payload.get("steps", 10))
-                action = self.generate_actions(**inputs, steps=steps).squeeze(0).float().cpu().numpy()
+                action = self.generate_actions(**inputs, steps=steps)[0].squeeze(0).float().cpu().numpy()
                 return JSONResponse({"action": action.tolist()})
 
             except Exception:

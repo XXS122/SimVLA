@@ -44,9 +44,10 @@ model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 每个 WebSocket 连接对应一个 episode，维护各自的 GRU 历史状态
-# key: connection_id（用 id(websocket) 标识），value: h_state Tensor [1, history_hidden]
-_episode_h_states: dict = {}
+# 每个 WebSocket 连接对应一个 episode，维护各自的 GRU 历史状态和 SubgoalVAE 子目标
+# key: connection_id（用 id(websocket) 标识）
+_episode_h_states: dict = {}       # GRU 隐状态 [1, history_hidden]
+_episode_z_goals: dict = {}        # SubgoalVAE 子目标 [1, latent_dim]（首步生成，之后复用）
 # 每个 episode 的 EE 位移历史，用于卡住检测
 _episode_ee_history: dict = {}
 _STUCK_THRESHOLD = 0.005  # EE 位移低于此值视为卡住
@@ -56,6 +57,7 @@ CONFIG = {
     "state_dim": 7,
     "action_dim": 7,
     "action_horizon": 10,
+    "ode_steps": 20,   # Flow Matching ODE 积分步数（独立于 action_horizon）
     "image_size": 384,
 }
 
@@ -159,10 +161,11 @@ def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
 
     proprio = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
-    # 获取当前 episode 的 GRU 历史状态
+    # 获取当前 episode 的 GRU 历史状态和 SubgoalVAE 子目标缓存
     h_state = _episode_h_states.get(conn_id, None)
+    z_goal_cache = _episode_z_goals.get(conn_id, None)
 
-    # 卡住检测：若连续多步 EE 位移过小，重置 GRU
+    # 卡住检测：若连续多步 EE 位移过小，重置 GRU 和子目标缓存
     ee_hist = _episode_ee_history.get(conn_id, [])
     if len(ee_hist) >= 1:
         disp = float(np.linalg.norm(state[:3] - ee_hist[-1][:3]))
@@ -172,8 +175,10 @@ def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
                 np.linalg.norm(ee_hist[-i][:3] - ee_hist[-i-1][:3]) < _STUCK_THRESHOLD
                 for i in range(1, _STUCK_STEPS)
             ):
-                logger.warning(f"[conn {conn_id}] 检测到机器人卡住，重置 GRU 历史状态")
+                logger.warning(f"[conn {conn_id}] 检测到机器人卡住，重置 GRU 和子目标缓存")
                 h_state = None
+                z_goal_cache = None  # 卡住时刷新子目标，让模型重新规划
+                _episode_z_goals.pop(conn_id, None)
                 ee_hist = []
         else:
             ee_hist = [state.copy()]  # 有效移动，重置计数
@@ -182,18 +187,22 @@ def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
     _episode_ee_history[conn_id] = ee_hist[-max(1, _STUCK_STEPS):]
 
     with torch.no_grad():
-        actions, new_h = model.generate_actions(
+        actions, new_h, new_z = model.generate_actions(
             input_ids=lang["input_ids"],
             image_input=images,
             image_mask=image_mask,
             proprio=proprio,
-            steps=CONFIG["action_horizon"],
+            steps=CONFIG["ode_steps"],
             h_state=h_state,
+            z_goal_cache=z_goal_cache,
         )
 
     # 更新 GRU 隐状态
     if new_h is not None:
         _episode_h_states[conn_id] = new_h
+    # 首步生成 z_goal 后缓存，后续步复用（保证同一 episode 子目标一致）
+    if new_z is not None and conn_id not in _episode_z_goals:
+        _episode_z_goals[conn_id] = new_z
 
     return {"actions": actions.cpu().numpy()[0]}  # [T, 7]
 
@@ -202,8 +211,9 @@ def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
 async def handle_connection(websocket, path=None):
     conn_id = id(websocket)
     logger.info(f"连接来自 {websocket.remote_address} (id={conn_id})")
-    # 新连接对应新 episode，初始化历史状态
+    # 新连接对应新 episode，初始化历史状态和子目标缓存
     _episode_h_states.pop(conn_id, None)
+    _episode_z_goals.pop(conn_id, None)
     _episode_ee_history.pop(conn_id, None)
     try:
         metadata = {
@@ -232,6 +242,7 @@ async def handle_connection(websocket, path=None):
     finally:
         # 连接关闭时清理 episode 状态，防止内存泄漏
         _episode_h_states.pop(conn_id, None)
+        _episode_z_goals.pop(conn_id, None)
         _episode_ee_history.pop(conn_id, None)
         logger.info(f"连接关闭 {websocket.remote_address} (id={conn_id})")
 
@@ -250,8 +261,11 @@ def main():
                         default=os.environ.get("SIMVLA_SMOLVLM_MODEL", "/root/model/smolvlm-500M"))
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--ode-steps", type=int, default=20,
+                        help="Flow Matching ODE 积分步数（更多步=更高质量，更慢）")
     args = parser.parse_args()
 
+    CONFIG["ode_steps"] = args.ode_steps
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
     asyncio.run(serve(args.host, args.port))
 
