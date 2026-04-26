@@ -109,7 +109,8 @@ class SimVLAEvaluator(Evaluator):
             from tqdm import tqdm
             for i in tqdm(range(self.n_episodes), desc=f"Evaluating {task} of {agent.name}"):
                 agent.reset()
-                kwargs = {"unnorm_key": "primitive", "max_episode_length": max_episode_length}
+                # unnorm_key=None：服务器已做反归一化，不再重复
+                kwargs = {"unnorm_key": None, "max_episode_length": max_episode_length}
                 try:
                     if self.episode_config is None:
                         info = self.evaluate_single_episode(agent, task, i, None, seed=42 + i, **kwargs)
@@ -207,7 +208,7 @@ def main():
         tasks=tasks,
         n_episodes=args.n_episode,
         episode_config=episode_config,
-        max_substeps=1,
+        max_substeps=5,
         save_dir=save_dir,
         metrics=args.metrics,
         out_dir=out_dir,
