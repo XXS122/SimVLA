@@ -774,13 +774,15 @@ class HistoryEncoder(nn.Module):
         """
         B, K, D = proprio_sequence.shape
         orig_dtype = proprio_sequence.dtype
-        # GRUCell 不支持 BFloat16，强制转为 float32 计算
-        x = proprio_sequence.float()
-        h = h_init.float() if h_init is not None else torch.zeros(
-            B, self.hidden_size, device=proprio_sequence.device, dtype=torch.float32
-        )
-        for k in range(K):
-            h = self.gru(x[:, k], h)
+        # GRUCell fused kernel 不支持 BFloat16（含 autocast 下的权重 bf16）
+        # 用 autocast(enabled=False) 完全禁用混合精度，强制 float32 计算
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            x = proprio_sequence.float()
+            h = h_init.float() if h_init is not None else torch.zeros(
+                B, self.hidden_size, device=proprio_sequence.device, dtype=torch.float32
+            )
+            for k in range(K):
+                h = self.gru(x[:, k], h)
 
         h = h.to(orig_dtype)
         cond = self.h_proj(self.h_norm(h))  # [B, adaln_hidden]
