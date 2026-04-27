@@ -204,7 +204,19 @@ def infer(obs: Dict[str, Any], conn_id: int) -> Dict[str, Any]:
     if new_z is not None and conn_id not in _episode_z_goals:
         _episode_z_goals[conn_id] = new_z
 
-    return {"actions": actions.cpu().numpy()[0]}  # [T, 7]
+    action_np = actions.cpu().numpy()[0]  # [T, 7]
+
+    # 工作空间裁剪：将 xyz 坐标限制在合法范围内，防止 IK 求解器失败
+    # VLABench Galaxea R1 工作空间（基于数据集统计的保守边界）
+    action_np[:, 0] = np.clip(action_np[:, 0], 0.15, 0.85)   # x: 前后
+    action_np[:, 1] = np.clip(action_np[:, 1], -0.50, 0.50)  # y: 左右
+    action_np[:, 2] = np.clip(action_np[:, 2], 0.00, 0.70)   # z: 上下
+    # axis_angle 旋转幅度裁剪（防止极端姿态）
+    action_np[:, 3:6] = np.clip(action_np[:, 3:6], -3.14, 3.14)
+    # gripper 归到 [0, 1]
+    action_np[:, 6] = np.clip(action_np[:, 6], 0.0, 1.0)
+
+    return {"actions": action_np}
 
 # ── WebSocket 服务 ────────────────────────────────────────────────────────────
 
