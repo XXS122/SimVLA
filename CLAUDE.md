@@ -136,22 +136,22 @@ python train_smolvlm.py \
 
 ## 评估
 
-### VLABench（两个环境）
+### VLABench（两个环境，各一个终端）
 ```bash
 # 终端1（simvla 环境）：启动推理服务器
 conda activate simvla
-CUDA_VISIBLE_DEVICES=0 python evaluation/vlabench/serve_smolvlm_vlabench.py \
-    --checkpoint /path/to/ckpt \
-    --norm_stats ./norm_stats/vlabench_norm.json \
-    --smolvlm_model /path/to/SmolVLM-500M-Instruct \
-    --port 8001
+bash serve_vlabench.sh <checkpoint_path> [port] [ode_steps]
+# 示例：
+bash serve_vlabench.sh ./simvla_output/simvla_hiphys/ckpt-100000
+bash serve_vlabench.sh ./simvla_output/simvla_hiphys/ckpt-100000 8001 20
 
 # 终端2（vlabench 环境）：运行评估
 conda activate vlabench
-cd /path/to/VLABench
-python /path/to/SimVLA/evaluation/vlabench/evaluate_simvla.py \
-    --eval-track track_1_in_distribution \
-    --n-episode 10 --port 8001 --save-dir /path/to/results
+bash evaluate_vlabench.sh [track] [n_episode] [port]
+# 示例：
+bash evaluate_vlabench.sh track_1_in_distribution
+bash evaluate_vlabench.sh track_1_in_distribution 10 8001
+bash evaluate_vlabench.sh track_5_long_horizon 50 8001
 
 # 支持的 track：
 # track_1_in_distribution, track_2_cross_category, track_3_common_sense,
