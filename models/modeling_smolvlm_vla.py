@@ -27,7 +27,7 @@ import json_numpy
 import cv2
 
 from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
-from .transformer_smolvlm import SmolVLMActionTransformer
+from .transformer_smolvlm import SmolVLMActionTransformer, SmolVLMActionTransformerV2
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
 
@@ -84,25 +84,40 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
-        
-        # Flow matching action head (SmolVLM version - no aux_visual)
-        self.transformer = SmolVLMActionTransformer(
-            hidden_size=config.hidden_size,
-            vlm_hidden_size=vlm_hidden_size,
-            depth=config.depth,
-            num_heads=config.num_heads,
-            mlp_ratio=config.mlp_ratio,
-            dim_action=dim_action,
-            dim_propio=dim_proprio,
-            dim_time=config.dim_time,
-            max_len_seq=config.max_len_seq,
-            use_adaln=self.use_adaln,
-        )
-        
-        if self.use_adaln:
-            logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
+        self.use_hypernet = getattr(config, 'use_hypernet', False)
+
+        # Flow matching action head
+        if self.use_hypernet:
+            self.transformer = SmolVLMActionTransformerV2(
+                hidden_size=config.hidden_size,
+                vlm_hidden_size=vlm_hidden_size,
+                depth=config.depth,
+                num_heads=config.num_heads,
+                mlp_ratio=config.mlp_ratio,
+                dim_action=dim_action,
+                dim_propio=dim_proprio,
+                dim_time=config.dim_time,
+                max_len_seq=config.max_len_seq,
+                hypernet_rank=getattr(config, 'hypernet_rank', 16),
+            )
+            logging.info(f"✓ HyperNet mode enabled: rank={getattr(config, 'hypernet_rank', 16)}")
         else:
-            logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
+            self.transformer = SmolVLMActionTransformer(
+                hidden_size=config.hidden_size,
+                vlm_hidden_size=vlm_hidden_size,
+                depth=config.depth,
+                num_heads=config.num_heads,
+                mlp_ratio=config.mlp_ratio,
+                dim_action=dim_action,
+                dim_propio=dim_proprio,
+                dim_time=config.dim_time,
+                max_len_seq=config.max_len_seq,
+                use_adaln=self.use_adaln,
+            )
+            if self.use_adaln:
+                logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
+            else:
+                logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
 
         # Deferred FastAPI app
         self.app: FastAPI | None = None
@@ -328,26 +343,36 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,           # [B, V]
         proprio: torch.Tensor,              # [B, dim_proprio]
         action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
+        t_override: torch.Tensor | None = None,       # 外部传入的时间采样（课程学习）
+        next_proprio: torch.Tensor | None = None,     # 辅助世界模型：下一时刻 proprio
+        state_loss_weight: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
-        
-        1) Time sampling: t ~ Beta(1.5, 1) * 0.999 + 0.001
+
+        1) Time sampling: t ~ Beta(alpha, 1) * 0.999 + 0.001（alpha 由课程学习控制）
         2) Interpolation: x_t = t * noise + (1-t) * actions
         3) Target: velocity u_t = noise - actions
         4) Model predicts v_t, compute MSE(v_t, u_t)
+        5) 可选：辅助 state 预测损失（next_proprio 不为 None 时启用）
         """
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
         B = input_ids.shape[0]
         device = input_ids.device
-        
-        # Beta(1.5, 1) time sampling
-        beta_dist = torch.distributions.Beta(
-            torch.tensor(1.5, device=device), 
-            torch.tensor(1.0, device=device)
-        )
-        t = beta_dist.sample((B,)) * 0.999 + 0.001
+
+        # 时间采样：优先使用外部传入的 t_override（课程学习），否则用默认 Beta(1.5, 1)
+        if t_override is not None:
+            t = t_override.to(device)
+        else:
+            beta_dist = torch.distributions.Beta(
+                torch.tensor(1.5, device=device),
+                torch.tensor(1.0, device=device)
+            )
+            t = beta_dist.sample((B,)) * 0.999 + 0.001
+        # 对齐 dtype：t 默认 float32，混合精度训练下 action 是 bfloat16，
+        # t_expanded * noise 会把 x_t 提升为 float32，导致 action_encoder dtype 不匹配
+        t = t.to(dtype=action.dtype)
 
         # Normalize action and proprio
         if hasattr(self.action_space, 'normalize_action'):
@@ -356,34 +381,161 @@ class SmolVLMVLA(PreTrainedModel):
             action_norm = self.action_space.normalize(action)
         else:
             action_norm = action
-            
+
         if hasattr(self.action_space, 'normalize_state'):
             proprio_norm = self.action_space.normalize_state(proprio)
         elif hasattr(self.action_space, 'normalize'):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
-        
+
         # Flow Matching
         noise = torch.randn_like(action_norm)
         t_expanded = t.view(-1, 1, 1)
         x_t = t_expanded * noise + (1 - t_expanded) * action_norm
         u_t = noise - action_norm
 
-        # Model prediction (no aux_visual_inputs for SmolVLM)
-        v_t = self.transformer(
-            vlm_features=enc["vlm_features"],
-            action_with_noise=x_t,
-            t=t,
-            proprio=proprio_norm,
-        )
-        
-        # MSE loss
+        # 辅助世界模型损失：需要 action_feats
+        use_state_loss = next_proprio is not None
+        if use_state_loss:
+            v_t, action_feats = self.transformer(
+                vlm_features=enc["vlm_features"],
+                action_with_noise=x_t,
+                t=t,
+                proprio=proprio_norm,
+                return_features=True,
+            )
+        else:
+            v_t = self.transformer(
+                vlm_features=enc["vlm_features"],
+                action_with_noise=x_t,
+                t=t,
+                proprio=proprio_norm,
+            )
+
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
-        return {"velocity_loss": velocity_loss}
+        loss_dict = {"velocity_loss": velocity_loss}
+
+        if use_state_loss:
+            state_pred = self.transformer.state_pred_head(action_feats[:, 0, :])  # [B, dim_proprio]
+            if hasattr(self.action_space, 'normalize_state'):
+                next_proprio_norm = self.action_space.normalize_state(next_proprio.to(device))
+            else:
+                next_proprio_norm = next_proprio.to(device)
+            state_loss = torch.mean(torch.square(state_pred - next_proprio_norm))
+            loss_dict["state_loss"] = state_loss_weight * state_loss
+
+        return loss_dict
 
     # ================================= inference =================================
+    @torch.no_grad()
+    def encode_static_context(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        static_view_idx: int = 0,
+    ) -> torch.Tensor:
+        """
+        只编码静态视角（agentview）+ 语言，返回缓存特征。
+        episode 开始时调用一次，后续每步复用。
+        """
+        static_images = image_input[:, static_view_idx:static_view_idx + 1, ...]
+        static_mask = image_mask[:, static_view_idx:static_view_idx + 1]
+        enc = self.forward_vlm_efficient(static_images, static_mask, input_ids)
+        return enc["vlm_features"]  # [B, T_static, D]
+
+    @torch.no_grad()
+    def encode_dynamic_view(
+        self,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        dynamic_view_idx: int = 1,
+    ) -> torch.Tensor:
+        """
+        只编码动态视角（eye_in_hand），每步调用。
+        不经过 text_model，只跑 vision_encoder + connector。
+        """
+        if image_input.dim() == 6:
+            if image_input.size(2) == 1:
+                image_input = image_input.squeeze(2)
+            else:
+                image_input = image_input[:, :, 0]
+
+        dyn_img = image_input[:, dynamic_view_idx, ...]  # [B, C, H, W]
+
+        vision_outputs = self.vlm.model.vision_model(
+            pixel_values=dyn_img,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        feats = vision_outputs.last_hidden_state  # [B, num_patches, vision_hidden]
+
+        if hasattr(self.vlm.model, 'connector'):
+            feats = self.vlm.model.connector(feats)
+        elif hasattr(self.vlm.model, 'multi_modal_projector'):
+            feats = self.vlm.model.multi_modal_projector(feats)
+
+        return feats  # [B, num_patches, D]
+
+    @torch.no_grad()
+    def generate_actions_with_cache(
+        self,
+        static_context: torch.Tensor,
+        dynamic_feats: torch.Tensor,
+        proprio: torch.Tensor,
+        steps: int = 10,
+        adaptive: bool = True,
+        cos_threshold: float = 0.97,
+        min_steps: int = 2,
+    ) -> torch.Tensor:
+        """
+        使用缓存的静态特征 + 当前动态特征推理，避免重复跑 text_model。
+        """
+        vlm_features = torch.cat([static_context, dynamic_feats], dim=1)
+
+        B = static_context.shape[0]
+        D = self.action_space.dim_action
+        device = proprio.device
+        dtype = proprio.dtype
+
+        if hasattr(self.action_space, 'normalize_state'):
+            proprio_norm = self.action_space.normalize_state(proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            proprio_norm = self.action_space.normalize(proprio)
+        else:
+            proprio_norm = proprio
+
+        steps = max(1, int(steps))
+        dt = -1.0 / steps
+        x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
+        t = 1.0
+        v_prev = None
+        actual_steps = 0
+
+        while t > -dt / 2:
+            t_tensor = torch.full((B,), t, device=device, dtype=dtype)
+            v_t = self.transformer(
+                vlm_features=vlm_features,
+                action_with_noise=x_t,
+                proprio=proprio_norm,
+                t=t_tensor,
+            )
+            x_t = x_t + dt * v_t
+            t = t + dt
+            actual_steps += 1
+
+            if adaptive and v_prev is not None and actual_steps >= min_steps:
+                v_flat = v_t.reshape(B, -1)
+                v_prev_flat = v_prev.reshape(B, -1)
+                cos_sim = torch.nn.functional.cosine_similarity(v_flat, v_prev_flat, dim=-1).mean()
+                if cos_sim.item() > cos_threshold:
+                    break
+            v_prev = v_t
+
+        self.last_actual_steps = actual_steps
+        return self.action_space.postprocess(x_t)
+
     @torch.no_grad()
     def generate_actions(
         self,
@@ -392,15 +544,14 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
+        adaptive: bool = False,
+        cos_threshold: float = 0.97,
+        min_steps: int = 2,
     ) -> torch.Tensor:
         """
         Flow Matching inference (Euler integration).
-        
-        1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
-        3) Final x_0 ≈ target action
+
+        adaptive=True 时：每步计算速度向量余弦相似度，收敛则提前停止。
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
@@ -410,7 +561,6 @@ class SmolVLMVLA(PreTrainedModel):
         device = proprio.device
         dtype = proprio.dtype
 
-        # Normalize proprio
         if hasattr(self.action_space, 'normalize_state'):
             proprio_norm = self.action_space.normalize_state(proprio)
         elif hasattr(self.action_space, 'normalize'):
@@ -418,26 +568,36 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+        v_prev = None
+        actual_steps = 0
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
             x_t = x_t + dt * v_t
             t = t + dt
-        
+            actual_steps += 1
+
+            if adaptive and v_prev is not None and actual_steps >= min_steps:
+                v_flat = v_t.reshape(B, -1)
+                v_prev_flat = v_prev.reshape(B, -1)
+                cos_sim = torch.nn.functional.cosine_similarity(v_flat, v_prev_flat, dim=-1).mean()
+                if cos_sim.item() > cos_threshold:
+                    break
+
+            v_prev = v_t
+
+        self.last_actual_steps = actual_steps
         return self.action_space.postprocess(x_t)
 
     # =============================== FastAPI service =============================

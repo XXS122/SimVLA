@@ -20,13 +20,11 @@ import time
 import json
 import random
 import argparse
-from collections import deque
 from pathlib import Path
 from typing import Dict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.optim import AdamW
 
@@ -37,14 +35,6 @@ from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 
 import logging
 import sys
-
-# TensorBoard (optional, for histograms)
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    HAS_TENSORBOARD = True
-except ImportError:
-    HAS_TENSORBOARD = False
-    SummaryWriter = None
 
 # WandB integration (optional)
 try:
@@ -155,22 +145,6 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
-
-    # HyperNet mode
-    parser.add_argument("--use_hypernet", action="store_true", default=False,
-                        help="Use HyperNet policy (VLM generates weight deltas)")
-    parser.add_argument("--hypernet_rank", type=int, default=4,
-                        help="Rank for HyperNet low-rank weight deltas")
-
-    # ⑤ 课程学习时间采样
-    parser.add_argument("--no_curriculum_time", action="store_true", default=False,
-                        help="Disable curriculum time sampling (use fixed Beta(1.5,1))")
-
-    # ⑥ 辅助世界模型损失
-    parser.add_argument("--use_state_loss", action="store_true", default=False,
-                        help="Enable auxiliary state prediction loss")
-    parser.add_argument("--state_loss_weight", type=float, default=0.1,
-                        help="Weight for state prediction loss")
     
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
@@ -212,31 +186,21 @@ def sample_time(B: int, global_step: int, total_steps: int, device) -> torch.Ten
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
     """Build optimizer with separate param groups."""
     vlm_params = list(model.vlm.parameters())
-
+    
     # Get action output params based on mode
     if hasattr(model.transformer, 'final_layer'):
         action_params = list(model.transformer.final_layer.parameters()) + list(model.transformer.action_encoder.parameters())
     else:
         action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
-
-    # HyperNet gets its own group (higher LR, not frozen during freeze_steps)
-    hypernet_params = []
-    if hasattr(model.transformer, 'hypernet'):
-        hypernet_params = list(model.transformer.hypernet.parameters())
-
-    exclude = set(map(id, vlm_params + action_params + hypernet_params))
+    
+    exclude = set(map(id, vlm_params + action_params))
     transformer_core_params = [p for p in model.parameters() if id(p) not in exclude]
-
+    
     param_groups = [
-        {"name": "vlm",              "params": vlm_params,              "lr": 0.0,       "weight_decay": weight_decay},
-        {"name": "transformer_core", "params": transformer_core_params, "lr": 0.0,       "weight_decay": weight_decay},
-        {"name": "action_heads",     "params": action_params,           "lr": lr,        "weight_decay": weight_decay},
+        {"name": "vlm", "params": vlm_params, "lr": 0.0, "weight_decay": weight_decay},
+        {"name": "transformer_core", "params": transformer_core_params, "lr": 0.0, "weight_decay": weight_decay},
+        {"name": "action_heads", "params": action_params, "lr": lr, "weight_decay": weight_decay},
     ]
-    if hypernet_params:
-        # HyperNet starts from random init → needs higher LR; not frozen during freeze_steps
-        param_groups.append(
-            {"name": "hypernet", "params": hypernet_params, "lr": lr * 3.0, "weight_decay": weight_decay}
-        )
     return AdamW(param_groups, betas=betas)
 
 
@@ -271,20 +235,18 @@ def update_group_lrs(optim, step, args):
         "vlm": args.learning_rate * args.learning_coef,
         "transformer_core": args.learning_rate,
         "action_heads": args.learning_rate,
-        "hypernet": args.learning_rate * 3.0,  # HyperNet always active, higher LR
     }
-
+    
     def schedule(step, base_lr):
         return linear_warmup_cosine(
-            step, args.freeze_steps, args.warmup_steps,
+            step, args.freeze_steps, args.warmup_steps, 
             args.iters, base_lr, args.min_lr_ratio
         )
-
+    
     if step < args.freeze_steps:
         set_group_lr(optim, "vlm", 0.0)
         set_group_lr(optim, "transformer_core", 0.0)
         set_group_lr(optim, "action_heads", base["action_heads"])
-        set_group_lr(optim, "hypernet", base["hypernet"])  # not frozen
     else:
         for name, base_lr in base.items():
             new_lr = schedule(step, base_lr) if args.use_cosine_decay else base_lr
@@ -394,8 +356,6 @@ def main(args):
             action_mode=args.action_mode,
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
-            use_hypernet=args.use_hypernet,
-            hypernet_rank=args.hypernet_rank,
             image_size=args.image_size,
         )
         model = SmolVLMVLA(config)
@@ -427,48 +387,23 @@ def main(args):
     )
     model, optim = accelerator.prepare(model, optim)
 
-    # TensorBoard SummaryWriter for histograms (main process only)
-    tb_writer = None
-    if HAS_TENSORBOARD and accelerator.is_main_process:
-        tb_writer = SummaryWriter(log_dir=str(output_dir))
-
-    # Diagnostic state
-    loss_history: deque = deque(maxlen=100)  # for rolling std
-    best_velocity_loss = float("inf")
-    last_delta_norm = 0.0
-
     # Training loop
     model.train()
-
+    
     start_step = 0
     if args.resume and load_path and os.path.isdir(load_path):
         state_json = os.path.join(load_path, "state.json")
         if os.path.exists(state_json):
             try:
                 with open(state_json, "r") as f:
-                    state_data = json.load(f)
-                    start_step = int(state_data.get("global_step", 0))
-                    best_velocity_loss = float(state_data.get("best_velocity_loss", float("inf")))
-                logger.info(f"Resuming from step: {start_step}, best_loss: {best_velocity_loss:.4f}")
+                    start_step = int(json.load(f).get("global_step", 0))
+                logger.info(f"Resuming from step: {start_step}")
             except Exception:
                 pass
-
-    def _save_ckpt(tag: str):
-        save_dir = os.path.join(output_dir, tag)
-        accelerator.print(f"💾 Saving model to {save_dir}")
-        accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
-        with open(os.path.join(save_dir, "state.json"), "w") as f:
-            json.dump({
-                "global_step": global_step,
-                "best_velocity_loss": best_velocity_loss,
-                "hypernet_mean_delta_norm": last_delta_norm,
-            }, f)
-
+    
     global_step, t0 = start_step, time.time()
     logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} iterations")
     logger.info(f"   world_size={accelerator.num_processes}")
-    if args.use_hypernet:
-        logger.info(f"   HyperNet mode: rank={args.hypernet_rank}")
 
     for batch in train_dataloader:
         # Encode language
@@ -476,106 +411,34 @@ def main(args):
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
-
+        
         # Update LR
         update_group_lrs(optim, global_step, args)
 
-        # 时间采样（⑤ 课程学习 or 固定 Beta(1.5,1)）
+        # 课程学习时间采样
         B = inputs["action"].shape[0]
-        device = inputs["action"].device
-        if args.no_curriculum_time:
-            beta_dist = torch.distributions.Beta(
-                torch.tensor(1.5, device=device),
-                torch.tensor(1.0, device=device),
-            )
-            t_sample = beta_dist.sample((B,)) * 0.999 + 0.001
-        else:
-            t_sample = sample_time(B, global_step, args.iters, device)
+        t_sample = sample_time(B, global_step, args.iters, inputs["action"].device)
         inputs["t_override"] = t_sample
-
-        # ⑥ 辅助世界模型损失：控制 next_proprio 是否传入
-        if not args.use_state_loss:
-            inputs.pop("next_proprio", None)
-        else:
-            inputs["state_loss_weight"] = args.state_loss_weight
-
-        # 过滤掉 forward 不接受的字段（如 attention_mask 等）
-        _FORWARD_KEYS = {
-            "input_ids", "image_input", "image_mask", "proprio", "action",
-            "t_override", "next_proprio", "state_loss_weight",
-        }
-        inputs = {k: v for k, v in inputs.items() if k in _FORWARD_KEYS}
 
         # Forward
         loss_dict: Dict[str, torch.Tensor] = model(**inputs)
         loss = sum(loss_dict.values())
-
-        # Track velocity loss for diagnostics
-        velocity_loss_val = loss_dict.get("loss_velocity", loss).detach().float().item()
-        loss_history.append(velocity_loss_val)
-
+        
         # Backward
         accelerator.backward(loss)
         if args.max_grad_norm:
             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-        # ---- Gradient norm diagnostics (before optimizer step) ----
-        if global_step % args.log_interval == 0 and accelerator.is_main_process:
-            grad_logs = {}
-            for g in optim.param_groups:
-                gn = sum(
-                    p.grad.norm() ** 2 for p in g["params"] if p.grad is not None
-                ) ** 0.5
-                grad_logs[f"grad/{g['name']}_norm"] = gn.item()
-        else:
-            grad_logs = {}
-
         optim.step()
         optim.zero_grad()
 
-        # ---- Logging ----
+        # Logging
         if global_step % args.log_interval == 0:
             logs = {k: v.detach().float().item() for k, v in loss_dict.items()}
             logs["loss_total"] = float(loss.detach().item())
             logs.update({f"lr_{g['name']}": g["lr"] for g in optim.param_groups})
-            # 课程学习 alpha
+            # 课程学习：记录当前 alpha
             progress = global_step / max(args.iters, 1)
             logs["time_sampling/alpha"] = 1.0 if progress < 0.3 else (1.5 if progress < 0.7 else 2.5)
-            logs.update(grad_logs)
-
-            # Loss rolling std (every 100 steps)
-            if len(loss_history) >= 10:
-                arr = list(loss_history)
-                mean_l = sum(arr) / len(arr)
-                std_l = (sum((v - mean_l) ** 2 for v in arr) / len(arr)) ** 0.5
-                logs["loss/velocity_std100"] = std_l / (mean_l + 1e-8)
-
-            # HyperNet diagnostics
-            if accelerator.is_main_process and args.use_hypernet:
-                unwrapped = accelerator.unwrap_model(model)
-                hn = unwrapped.transformer
-                if hasattr(hn, 'last_task_vec') and hn.last_task_vec is not None:
-                    with torch.no_grad():
-                        deltas = hn.hypernet(hn.last_task_vec[:1])
-                        delta_norms = []
-                        for i, (d1, d2) in enumerate(deltas):
-                            n1 = d1[0].norm().item()
-                            n2 = d2[0].norm().item()
-                            logs[f"hypernet/layer{i}_fc1_norm"] = n1
-                            logs[f"hypernet/layer{i}_fc2_norm"] = n2
-                            delta_norms.extend([n1, n2])
-                        mean_delta = sum(delta_norms) / len(delta_norms)
-                        logs["hypernet/mean_delta_norm"] = mean_delta
-                        last_delta_norm = mean_delta
-
-                        base_norms = [
-                            p.norm().item()
-                            for name, p in hn.named_parameters()
-                            if 'blocks' in name and ('fc1.weight' in name or 'fc2.weight' in name)
-                        ]
-                        base_norm = sum(base_norms) / len(base_norms) if base_norms else 1.0
-                        logs["hypernet/delta_to_base_ratio"] = mean_delta / (base_norm + 1e-8)
-
             accelerator.log(logs, step=global_step)
 
             if accelerator.is_main_process:
@@ -584,52 +447,24 @@ def main(args):
                 logger.info(
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
-                    f"lr_core={logs.get('lr_transformer_core', 0):.2e} "
-                    f"lr_action={logs.get('lr_action_heads', 0):.2e} "
-                    f"lr_vlm={logs.get('lr_vlm', 0):.2e} ({dt:.2f}s/it)"
+                    f"lr_core={logs['lr_transformer_core']:.2e} "
+                    f"lr_action={logs['lr_action_heads']:.2e} "
+                    f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
                 )
-
-        # task_vec diversity (every 1000 steps)
-        if global_step % 1000 == 0 and accelerator.is_main_process and args.use_hypernet:
-            unwrapped = accelerator.unwrap_model(model)
-            hn = unwrapped.transformer
-            if hasattr(hn, 'last_task_vec') and hn.last_task_vec is not None and hn.last_task_vec.shape[0] > 1:
-                with torch.no_grad():
-                    tv = F.normalize(hn.last_task_vec.float(), dim=-1)
-                    cos_sim = (tv @ tv.T).mean().item()
-                    accelerator.log({"hypernet/task_vec_diversity": 1.0 - cos_sim}, step=global_step)
-
-        # TensorBoard histograms (every 5000 steps)
-        if tb_writer is not None and global_step % 5000 == 0 and args.use_hypernet:
-            unwrapped = accelerator.unwrap_model(model)
-            hn = unwrapped.transformer
-            for name, param in hn.hypernet.named_parameters():
-                tb_writer.add_histogram(f"weights/hypernet/{name}", param.data, global_step)
-            if hasattr(hn, 'last_deltas') and hn.last_deltas:
-                tb_writer.add_histogram("delta/layer0_fc1", hn.last_deltas[0][0][0], global_step)
-                tb_writer.add_histogram("delta/last_fc2", hn.last_deltas[-1][1][0], global_step)
-
-        # ---- Checkpointing ----
+        
+        # Checkpointing
         global_step += 1
         if accelerator.is_main_process:
-            # Early frequent saves (first 5000 steps)
-            if global_step < 5000 and global_step % 1000 == 0:
-                _save_ckpt(f"ckpt-{global_step}")
-
-            # Best checkpoint
-            if velocity_loss_val < best_velocity_loss:
-                best_velocity_loss = velocity_loss_val
-                _save_ckpt("ckpt-best")
-
-            # Regular interval + final
             if global_step == args.iters or global_step % args.save_interval == 0:
-                _save_ckpt(f"ckpt-{global_step}")
-
+                save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
+                accelerator.print(f"💾 Saving model to {save_dir}")
+                accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+                with open(os.path.join(save_dir, "state.json"), "w") as f:
+                    json.dump({"global_step": global_step}, f)
+                    
         if global_step >= args.iters:
             break
 
-    if tb_writer is not None:
-        tb_writer.close()
     accelerator.end_training()
 
 

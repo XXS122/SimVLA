@@ -14,7 +14,7 @@ set -e
 
 BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
-OUTPUT_DIR=${3:-./runs/simvla_libero_small}
+OUTPUT_DIR=${3:-./runs/simvla_hypernet}
 RESUME_CKPT=${4:-""}
 
 echo "Training parameters:"
@@ -24,7 +24,7 @@ echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
 # GPU configuration
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -37,7 +37,7 @@ NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
 
 # SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}"
 
 # =============================================================================
 # Training hyperparameters
@@ -57,6 +57,10 @@ HIDDEN_SIZE=768
 DEPTH=12                 
 NUM_HEADS=12             
 USE_ADALN=false          # DiT-style conditioning
+USE_HYPERNET=true       # HyperNet policy (VLM generates weight deltas)
+HYPERNET_RANK=4          # Rank for low-rank weight deltas
+USE_STATE_LOSS=false     # ⑥ 辅助世界模型损失
+STATE_LOSS_WEIGHT=0.1
 
 # =============================================================================
 # Step 1: Create training metadata (if not exists)
@@ -109,6 +113,16 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
+# Add HyperNet flag if enabled
+if [ "${USE_HYPERNET}" = true ]; then
+    ARGS="${ARGS} --use_hypernet --hypernet_rank ${HYPERNET_RANK}"
+fi
+
+# Add state loss if enabled
+if [ "${USE_STATE_LOSS}" = true ]; then
+    ARGS="${ARGS} --use_state_loss --state_loss_weight ${STATE_LOSS_WEIGHT}"
+fi
+
 # Add resume checkpoint if specified
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
@@ -143,7 +157,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=2 \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

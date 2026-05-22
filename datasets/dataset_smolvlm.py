@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List
 import io
 import json
+import os
 import random
 import numpy as np
 import torch
@@ -23,6 +24,27 @@ from .utils import action_slice
 from .domain_config import DATA_WEIGHTS
 from .domain_handler.registry import get_handler_cls
 
+
+def _dataloader_worker_init(worker_id: int):
+    """模块级 worker 初始化函数（spawn/fork 均可 pickle）。"""
+    # 在任何其他 import 之前隐藏 GPU，防止 TF/JAX 在子进程里初始化 CUDA
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
+    import numpy as np
+    base_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(base_seed)
+    random.seed(base_seed)
+    torch.manual_seed(base_seed)
+
+    try:
+        import tensorflow as tf
+        tf.config.set_visible_devices([], "GPU")
+        tf.get_logger().setLevel("ERROR")
+    except Exception:
+        pass
 
 class SmolVLMDataReader(IterableDataset):
     """
@@ -168,8 +190,10 @@ class SmolVLMDataReader(IterableDataset):
                     yield sample
             except Exception as e:
                 continue
-                
-        if self.training:
+
+    def _infinite_iter(self, dataset_name: str) -> Iterable[dict]:
+        """Infinite iterator over one dataset, restarting each epoch."""
+        while True:
             yield from self._iter_one_dataset(dataset_name)
 
     def __iter__(self):
@@ -179,7 +203,7 @@ class SmolVLMDataReader(IterableDataset):
             for n in names:
                 yield from self._iter_one_dataset(n)
         else:
-            gens = [iter(self._iter_one_dataset(n)) for n in names]
+            gens = [self._infinite_iter(n) for n in names]
             ws = [DATA_WEIGHTS.get(n, 1.0) for n in names]
             s = sum(ws)
             ws = [w / s for w in ws]
@@ -318,25 +342,7 @@ def create_smolvlm_dataloader(
         PyTorch DataLoader for SmolVLM-VLA training.
     """
     from torch.utils.data import DataLoader
-    
-    def worker_init_fn(worker_id: int):
-        """Worker initialization."""
-        base_seed = torch.initial_seed() % (2**32)
-        import random
-        np.random.seed(base_seed)
-        random.seed(base_seed)
-        torch.manual_seed(base_seed)
-        
-        import os
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        try:
-            import tensorflow as tf
-            tf.config.set_visible_devices([], "GPU")
-            tf.get_logger().setLevel("ERROR")
-        except Exception:
-            pass
-    
+
     # Choose dataset class
     if use_smart_padding:
         DatasetClass = SmolVLMDataReaderWithPadding
@@ -356,7 +362,7 @@ def create_smolvlm_dataloader(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
-        worker_init_fn=worker_init_fn,
+        worker_init_fn=_dataloader_worker_init,
         persistent_workers=num_workers > 0,
     )
 

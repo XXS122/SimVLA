@@ -1,0 +1,25 @@
+# 本机路径配置
+paths.env
+
+# 训练输出
+runs/
+simvla_output/
+
+# 评估输出
+evaluation/libero/eval_simvla_*/
+eval_simvla_*.txt
+*.mp4
+# 数据集元数据与归一化统计（本地生成）
+datasets/metas/libero_train.json
+norm_stats/libero_norm.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 日志
+*.log
+wandb/
+runs/

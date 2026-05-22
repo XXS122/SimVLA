@@ -46,6 +46,10 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
+
+        # === HyperNet Mode ===
+        use_hypernet: bool = False,
+        hypernet_rank: int = 4,
         
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
@@ -71,6 +75,10 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
+
+        # HyperNet settings
+        self.use_hypernet = use_hypernet
+        self.hypernet_rank = hypernet_rank
         
         # Image settings
         self.image_size = image_size

@@ -177,12 +177,7 @@ def infer(observation: Dict[str, Any], conn_id: int = None) -> Dict[str, Any]:
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
 
         # 静态-动态解耦推理
-        adaptive = CONFIG.get("adaptive", True)
-        cos_threshold = CONFIG.get("cos_threshold", 0.97)
-        min_steps = CONFIG.get("min_steps", 2)
-        use_static_cache = CONFIG.get("use_static_cache", True)
-
-        if use_static_cache and conn_id is not None:
+        if conn_id is not None:
             # 第一步：计算并缓存静态特征（agentview + 语言）
             if _static_cache.get(conn_id) is None:
                 static_context = model.encode_static_context(
@@ -207,9 +202,9 @@ def infer(observation: Dict[str, Any], conn_id: int = None) -> Dict[str, Any]:
                 dynamic_feats=dynamic_feats,
                 proprio=proprio_tensor,
                 steps=CONFIG["action_horizon"],
-                adaptive=adaptive,
-                cos_threshold=cos_threshold,
-                min_steps=min_steps,
+                adaptive=True,
+                cos_threshold=0.97,
+                min_steps=2,
             )
         else:
             # 回退：完整推理（无缓存）
@@ -219,13 +214,10 @@ def infer(observation: Dict[str, Any], conn_id: int = None) -> Dict[str, Any]:
                 image_mask=image_mask,
                 proprio=proprio_tensor,
                 steps=CONFIG["action_horizon"],
-                adaptive=adaptive,
-                cos_threshold=cos_threshold,
-                min_steps=min_steps,
+                adaptive=True,
+                cos_threshold=0.97,
+                min_steps=2,
             )
-
-        actual_steps = getattr(model, 'last_actual_steps', CONFIG["action_horizon"])
-        logger.debug(f"Inference used {actual_steps} ODE steps")
 
         actions = actions.cpu().numpy()[0]
 
@@ -242,11 +234,6 @@ async def handle_connection(websocket, path=None):
     logger.info(f"Connection from {websocket.remote_address} opened")
     conn_id = id(websocket)
     _static_cache[conn_id] = None  # 新 episode，清空静态特征缓存
-
-    use_static_cache = CONFIG.get("use_static_cache", True)
-    adaptive = CONFIG.get("adaptive", True)
-    logger.info(f"Episode started: static_cache={'enabled' if use_static_cache else 'disabled'}, "
-                f"adaptive={'enabled' if adaptive else 'disabled'}")
 
     try:
         # Send server metadata on connection
@@ -272,9 +259,8 @@ async def handle_connection(websocket, path=None):
                     import json
                     request = json.loads(message)
 
-                # Run inference (pass conn_id only when static cache is enabled)
-                effective_conn_id = conn_id if CONFIG.get("use_static_cache", True) else None
-                result = infer(request, conn_id=effective_conn_id)
+                # Run inference
+                result = infer(request, conn_id=conn_id)
 
                 # Send response (convert numpy to list for compatibility)
                 actions = result["actions"]
@@ -320,43 +306,23 @@ def main():
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str,
+    parser.add_argument("--smolvlm_model", type=str, 
                         default="HuggingFaceTB/SmolVLM-500M-Instruct",
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    # ③ 自适应推理步数
-    parser.add_argument("--adaptive", action="store_true", default=True,
-                        help="Use adaptive ODE steps (cosine similarity early stopping)")
-    parser.add_argument("--no_adaptive", dest="adaptive", action="store_false")
-    parser.add_argument("--cos_threshold", type=float, default=0.97,
-                        help="Cosine similarity threshold for adaptive stopping")
-    parser.add_argument("--min_steps", type=int, default=2,
-                        help="Minimum ODE steps before adaptive stopping")
-    # ① 静态动态解耦
-    parser.add_argument("--use_static_cache", action="store_true", default=True,
-                        help="Cache static VLM features per episode (faster inference)")
-    parser.add_argument("--no_static_cache", dest="use_static_cache", action="store_false")
-
+    
     args = parser.parse_args()
-
-    # Store inference config globally
-    CONFIG["adaptive"] = args.adaptive
-    CONFIG["cos_threshold"] = args.cos_threshold
-    CONFIG["min_steps"] = args.min_steps
-    CONFIG["use_static_cache"] = args.use_static_cache
-
+    
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-
+    
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
-
+    
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
-    logger.info(f"  Adaptive steps: {args.adaptive} (threshold={args.cos_threshold}, min={args.min_steps})")
-    logger.info(f"  Static cache: {args.use_static_cache}")
-
+    
     asyncio.run(serve(args.host, args.port))
 
 

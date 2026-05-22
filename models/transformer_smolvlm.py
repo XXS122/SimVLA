@@ -290,7 +290,7 @@ class SmolVLMActionTransformer(nn.Module):
             self.blocks = nn.ModuleList(
                 [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
             )
-            
+
             # Condition encoders
             self.time_proj = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
@@ -301,14 +301,14 @@ class SmolVLMActionTransformer(nn.Module):
             self.vlm_cond_proj = nn.Linear(vlm_hidden_size, hidden_size)
             # Proprio projection
             self.proprio_proj = nn.Linear(dim_propio, hidden_size)
-            
+
             # Action encoder
             self.action_encoder = nn.Linear(dim_action, hidden_size)
-            
+
             # Position encoding
             self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
             nn.init.normal_(self.pos_emb, std=0.02)
-            
+
             # Final layer
             self.final_layer = FinalLayer(hidden_size, dim_action)
         else:
@@ -324,11 +324,18 @@ class SmolVLMActionTransformer(nn.Module):
             nn.init.normal_(self.pos_emb, std=0.02)
 
             self.norm = nn.LayerNorm(hidden_size)
-            
+
             # Action encoder/decoder
             action_input_dim = dim_action + dim_time + dim_propio
             self.action_encoder = nn.Linear(action_input_dim, hidden_size)
             self.action_decoder = nn.Linear(hidden_size, dim_action)
+
+        # 辅助世界模型头：预测执行动作后的下一个 proprio 状态
+        self.state_pred_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, dim_propio),
+        )
 
         self.apply(basic_init)
 
@@ -338,25 +345,17 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_features: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for SmolVLM Action Transformer.
 
-        Inputs
-        ------
-        vlm_features : [B, T_vlm, D] - Unified features from SmolVLM (all views processed together)
-        action_with_noise : [B, T_action, dim_action]
-        proprio : [B, dim_proprio]
-        t : [B]
-
-        Returns
-        -------
-        Tensor: Predicted velocity, [B, T_action, dim_action]
+        return_features=True 时额外返回动作 token 特征（用于辅助世界模型损失）。
         """
         if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
+            return self._forward_adaln(vlm_features, action_with_noise, proprio, t, return_features)
         else:
-            return self._forward_concat(vlm_features, action_with_noise, proprio, t)
+            return self._forward_concat(vlm_features, action_with_noise, proprio, t, return_features)
     
     def _forward_concat(
         self,
@@ -364,12 +363,10 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_features: bool = False,
     ) -> torch.Tensor:
         """
         Concat mode forward pass.
-        
-        Simplified: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-        No aux_visual_inputs needed.
         """
         B, num_actions = action_with_noise.shape[:2]
 
@@ -377,7 +374,7 @@ class SmolVLMActionTransformer(nn.Module):
         time_emb = timestep_embedding(t, self.dim_time)
         time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
         proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
-        
+
         action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
         x = self.action_encoder(action_tokens)  # [B, T_action, H]
 
@@ -396,8 +393,12 @@ class SmolVLMActionTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        # Decode only the action segment
-        return self.action_decoder(self.norm(x[:, :num_actions]))
+        action_feats = self.norm(x[:, :num_actions])  # [B, T_action, H]
+        velocity = self.action_decoder(action_feats)   # [B, T_action, dim_action]
+
+        if return_features:
+            return velocity, action_feats
+        return velocity
     
     def _forward_adaln(
         self,
@@ -405,45 +406,324 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_features: bool = False,
     ) -> torch.Tensor:
         """
         DiT/AdaLN mode forward pass.
-        
-        Conditions (time, vlm, proprio) injected via AdaLN.
-        No aux_visual needed for SmolVLM.
         """
         B, num_actions = action_with_noise.shape[:2]
-        
+
         # ========== 1. Build global condition c ==========
-        # Time embedding
         t_emb = timestep_embedding(t, self.hidden_size)
         t_emb = self.time_proj(t_emb)  # [B, H]
-        
-        # VLM condition: Global Average Pooling
+
         vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
-        # Proprio condition
         proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
-        # Fuse all conditions
         c = t_emb + vlm_cond + proprio_cond  # [B, H]
-        
+
         # ========== 2. Encode action sequence ==========
         x = self.action_encoder(action_with_noise)  # [B, T_action, H]
-        
-        # Add position encoding
         x = x + self.pos_emb[:, :num_actions, :]
-        
+
         # ========== 3. DiT Blocks with AdaLN ==========
         for block in self.blocks:
             x = block(x, c)
-        
+
         # ========== 4. Final Layer with AdaLN ==========
-        return self.final_layer(x, c)
+        velocity = self.final_layer(x, c)  # [B, T_action, dim_action]
+
+        if return_features:
+            return velocity, x
+        return velocity
+
+
+# ================================ HyperNet ===================================
+
+class HyperNet(nn.Module):
+    """
+    Hypernetwork: maps task_vec (mean-pooled VLM features) to per-layer low-rank
+    weight deltas for the action transformer MLP layers.
+
+    Architecture: shared trunk compresses task_vec to a compact task_emb,
+    then per-layer heads map task_emb to low-rank factors A and B.
+
+    For each transformer block:
+      ΔW_fc1 = B_fc1 @ A_fc1  [M, H]   (rank-r approximation)
+      ΔW_fc2 = B_fc2 @ A_fc2  [H, M]
+
+    Parameter budget (rank=4, task_emb_dim=32, H=768, M=3072):
+      trunk:  ~0.47M
+      heads:  ~11.8M (12 layers × ~0.98M per head)
+      total:  ~12.3M new parameters
+    """
+
+    def __init__(
+        self,
+        vlm_hidden_size: int = 576,
+        hidden_size: int = 768,
+        num_layers: int = 12,
+        rank: int = 4,
+        mlp_ratio: float = 4.0,
+        task_emb_dim: int = 32,
+    ) -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        self.rank = rank
+        self.hidden_size = hidden_size
+        self.mlp_hidden = int(hidden_size * mlp_ratio)
+        self.task_emb_dim = task_emb_dim
+
+        H, M, r, D = hidden_size, self.mlp_hidden, rank, task_emb_dim
+        # per-layer output: A_fc1[r,H] + B_fc1[M,r] + A_fc2[r,M] + B_fc2[H,r]
+        per_layer_dim = 2 * rank * (hidden_size + self.mlp_hidden)
+
+        # Shared trunk: compress task_vec → compact task embedding
+        self.trunk = nn.Sequential(
+            nn.Linear(vlm_hidden_size, hidden_size), nn.SiLU(),
+            nn.Linear(hidden_size, task_emb_dim),
+        )
+
+        # Per-layer heads: each independently maps task_emb → layer deltas
+        self.heads = nn.ModuleList([
+            nn.Linear(task_emb_dim, per_layer_dim) for _ in range(num_layers)
+        ])
+
+        # Zero-init all heads so deltas start at 0, preserving pretrained weights
+        for head in self.heads:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def forward(self, task_vec: torch.Tensor):
+        """
+        Args:
+            task_vec: [B, vlm_hidden_size]
+        Returns:
+            list of (delta_fc1, delta_fc2) tuples, length = num_layers
+              delta_fc1: [B, mlp_hidden, hidden_size]
+              delta_fc2: [B, hidden_size, mlp_hidden]
+        """
+        feat = self.trunk(task_vec)  # [B, task_emb_dim]
+        r, H, M = self.rank, self.hidden_size, self.mlp_hidden
+        deltas = []
+        for head in self.heads:
+            raw = head(feat)  # [B, 2*r*(H+M)]
+            offset = 0
+            A_fc1 = raw[:, offset:offset + r * H].view(-1, r, H); offset += r * H
+            B_fc1 = raw[:, offset:offset + M * r].view(-1, M, r); offset += M * r
+            A_fc2 = raw[:, offset:offset + r * M].view(-1, r, M); offset += r * M
+            B_fc2 = raw[:, offset:offset + H * r].view(-1, H, r); offset += H * r
+            deltas.append((B_fc1 @ A_fc1, B_fc2 @ A_fc2))  # ([B,M,H], [B,H,M])
+        return deltas
+
+
+class HyperNetMlp(nn.Module):
+    """MLP that accepts per-sample weight deltas from HyperNet."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        norm_layer: type[nn.Module] | None = None,
+        bias: bool | Tuple[bool, bool] = True,
+        drop: float | Tuple[float, float] = 0.0,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        bias = _to_2tuple(bias)
+        drop_probs = _to_2tuple(drop)
+
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0])
+        self.act = nn.GELU(approximate="tanh")
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        delta_fc1: torch.Tensor | None = None,
+        delta_fc2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:          [B, T, H]
+            delta_fc1:  [B, M, H]  per-sample weight delta for fc1
+            delta_fc2:  [B, H, M]  per-sample weight delta for fc2
+        """
+        if delta_fc1 is not None:
+            # w1[b] = fc1.weight + delta_fc1[b],  shape [M, H]
+            # einsum: h = x @ w1.T + bias  →  'bth,bmh->btm'
+            w1 = self.fc1.weight.unsqueeze(0) + delta_fc1  # [B, M, H]
+            h = torch.einsum("bth,bmh->btm", x, w1) + self.fc1.bias
+        else:
+            h = self.fc1(x)
+        h = self.act(h)
+        h = self.drop1(h)
+        h = self.norm(h)
+        if delta_fc2 is not None:
+            w2 = self.fc2.weight.unsqueeze(0) + delta_fc2  # [B, H, M]
+            out = torch.einsum("btm,bhm->bth", h, w2) + self.fc2.bias
+        else:
+            out = self.fc2(h)
+        return self.drop2(out)
+
+
+class HyperNetTransformerBlock(nn.Module):
+    """TransformerBlock whose MLP accepts per-sample weight deltas."""
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
+        self.mlp = HyperNetMlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            drop=0.1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        delta_fc1: torch.Tensor | None = None,
+        delta_fc2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x), delta_fc1, delta_fc2)
+        return x
+
+
+class SmolVLMActionTransformerV2(nn.Module):
+    """
+    HyperNet Policy: action transformer whose MLP weights are dynamically
+    modulated by task-specific low-rank deltas generated from VLM features.
+
+    Two parallel conditioning paths:
+      1. Concat path  — VLM tokens concatenated to action sequence (token-level)
+      2. HyperNet path — VLM mean-pooled → weight deltas (parameter-level)
+
+    Interface is identical to SmolVLMActionTransformer (concat mode).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        vlm_hidden_size: int = 576,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        dim_action: int = 26,
+        dim_propio: int = 21,
+        dim_time: int = 32,
+        max_len_seq: int = 1024,
+        use_adaln: bool = False,  # ignored, kept for API compatibility
+        hypernet_rank: int = 4,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dim_action = dim_action
+        self.dim_time = dim_time
+        self.dim_propio = dim_propio
+
+        # HyperNet: task_vec → per-layer weight deltas
+        self.hypernet = HyperNet(
+            vlm_hidden_size=vlm_hidden_size,
+            hidden_size=hidden_size,
+            num_layers=depth,
+            rank=hypernet_rank,
+            mlp_ratio=mlp_ratio,
+            task_emb_dim=32,
+        )
+
+        # Transformer blocks with HyperNet-modulated MLP
+        self.blocks = nn.ModuleList([
+            HyperNetTransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+            for _ in range(depth)
+        ])
+
+        # Concat path: project VLM tokens into action transformer space
+        self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
+
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        self.norm = nn.LayerNorm(hidden_size)
+
+        action_input_dim = dim_action + dim_time + dim_propio
+        self.action_encoder = nn.Linear(action_input_dim, hidden_size)
+        self.action_decoder = nn.Linear(hidden_size, dim_action)
+
+        # Auxiliary world model head (same as original)
+        self.state_pred_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, dim_propio),
+        )
+
+        self.apply(basic_init)
+        # Re-zero HyperNet heads after basic_init so deltas start at 0
+        for head in self.hypernet.heads:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+        # Diagnostic caches (detached, no grad)
+        self.last_task_vec: torch.Tensor | None = None
+        self.last_deltas: list | None = None
+
+    def forward(
+        self,
+        vlm_features: torch.Tensor,   # [B, T_vlm, D_vlm]
+        action_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+        return_features: bool = False,
+    ) -> torch.Tensor:
+        B, num_actions = action_with_noise.shape[:2]
+
+        # ---- HyperNet path: generate per-layer weight deltas ----
+        task_vec = vlm_features.mean(dim=1)  # [B, D_vlm]
+        deltas = self.hypernet(task_vec)      # list of (delta_fc1, delta_fc2)
+
+        # Cache for training diagnostics (detached)
+        self.last_task_vec = task_vec.detach()
+        self.last_deltas = [(d1.detach(), d2.detach()) for d1, d2 in deltas]
+
+        # ---- Encode action tokens ----
+        time_emb = timestep_embedding(t, self.dim_time)
+        time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
+        proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
+        action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
+        x = self.action_encoder(action_tokens)  # [B, T_action, H]
+
+        # ---- Concat path: append projected VLM tokens ----
+        x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
+
+        seq_len = x.shape[1]
+        if seq_len > self.pos_emb.shape[1]:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}.")
+        x = x + self.pos_emb[:, :seq_len, :]
+
+        # ---- Transformer blocks with HyperNet weight modulation ----
+        for block, (d_fc1, d_fc2) in zip(self.blocks, deltas):
+            x = block(x, d_fc1, d_fc2)
+
+        action_feats = self.norm(x[:, :num_actions])   # [B, T_action, H]
+        velocity = self.action_decoder(action_feats)    # [B, T_action, dim_action]
+
+        if return_features:
+            return velocity, action_feats
+        return velocity
 
 
 __all__ = [
     "SmolVLMActionTransformer",
+    "SmolVLMActionTransformerV2",
+    "HyperNet",
+    "HyperNetMlp",
+    "HyperNetTransformerBlock",
     "TransformerBlock",
     "DiTBlock",
     "FinalLayer",
