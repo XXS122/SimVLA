@@ -511,7 +511,7 @@ def main(args):
         loss = sum(loss_dict.values())
 
         # Track velocity loss for diagnostics
-        velocity_loss_val = loss_dict.get("loss_velocity", loss).detach().float().item()
+        velocity_loss_val = loss_dict.get("velocity_loss", loss).detach().float().item()
         loss_history.append(velocity_loss_val)
 
         # Backward

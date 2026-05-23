@@ -326,16 +326,16 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     # ③ 自适应推理步数
-    parser.add_argument("--adaptive", action="store_true", default=True,
+    parser.add_argument("--adaptive", action="store_true", default=False,
                         help="Use adaptive ODE steps (cosine similarity early stopping)")
     parser.add_argument("--no_adaptive", dest="adaptive", action="store_false")
     parser.add_argument("--cos_threshold", type=float, default=0.97,
                         help="Cosine similarity threshold for adaptive stopping")
-    parser.add_argument("--min_steps", type=int, default=2,
+    parser.add_argument("--min_steps", type=int, default=4,
                         help="Minimum ODE steps before adaptive stopping")
     # ① 静态动态解耦
-    parser.add_argument("--use_static_cache", action="store_true", default=True,
-                        help="Cache static VLM features per episode (faster inference)")
+    parser.add_argument("--use_static_cache", action="store_true", default=False,
+                        help="Cache static VLM features per episode (faster inference, may reduce accuracy)")
     parser.add_argument("--no_static_cache", dest="use_static_cache", action="store_false")
 
     args = parser.parse_args()
