@@ -550,15 +550,18 @@ def main(args):
                 std_l = (sum((v - mean_l) ** 2 for v in arr) / len(arr)) ** 0.5
                 logs["loss/velocity_std100"] = std_l / (mean_l + 1e-8)
 
-            # HyperNet diagnostics
+            # HyperNet diagnostics — 用单样本 factors 重算 delta 范数（成本极低）
             if accelerator.is_main_process and args.use_hypernet:
                 unwrapped = accelerator.unwrap_model(model)
                 hn = unwrapped.transformer
                 if hasattr(hn, 'last_task_vec') and hn.last_task_vec is not None:
                     with torch.no_grad():
-                        deltas = hn.hypernet(hn.last_task_vec[:1])
+                        factors = hn.hypernet(hn.last_task_vec[:1])
                         delta_norms = []
-                        for i, (d1, d2) in enumerate(deltas):
+                        for i, (A1, B1, A2, B2) in enumerate(factors):
+                            # 仅为诊断展开 delta，单样本只需一次 [M,r]@[r,H] = 小开销
+                            d1 = hn.hypernet.materialize_delta(A1, B1)  # [1, M, H]
+                            d2 = hn.hypernet.materialize_delta(A2, B2)  # [1, H, M]
                             n1 = d1[0].norm().item()
                             n2 = d2[0].norm().item()
                             logs[f"hypernet/layer{i}_fc1_norm"] = n1
@@ -605,9 +608,14 @@ def main(args):
             hn = unwrapped.transformer
             for name, param in hn.hypernet.named_parameters():
                 tb_writer.add_histogram(f"weights/hypernet/{name}", param.data, global_step)
-            if hasattr(hn, 'last_deltas') and hn.last_deltas:
-                tb_writer.add_histogram("delta/layer0_fc1", hn.last_deltas[0][0][0], global_step)
-                tb_writer.add_histogram("delta/last_fc2", hn.last_deltas[-1][1][0], global_step)
+            if hasattr(hn, 'last_factors') and hn.last_factors:
+                # 单样本展开 delta 做直方图（only one sample, cheap）
+                A1, B1, _, _ = hn.last_factors[0]
+                _, _, A2, B2 = hn.last_factors[-1]
+                d0_fc1 = hn.hypernet.materialize_delta(A1[:1], B1[:1])[0]
+                dlast_fc2 = hn.hypernet.materialize_delta(A2[:1], B2[:1])[0]
+                tb_writer.add_histogram("delta/layer0_fc1", d0_fc1, global_step)
+                tb_writer.add_histogram("delta/last_fc2", dlast_fc2, global_step)
 
         # ---- Checkpointing ----
         global_step += 1

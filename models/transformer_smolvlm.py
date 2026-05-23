@@ -498,13 +498,18 @@ class HyperNet(nn.Module):
         Args:
             task_vec: [B, vlm_hidden_size]
         Returns:
-            list of (delta_fc1, delta_fc2) tuples, length = num_layers
-              delta_fc1: [B, mlp_hidden, hidden_size]
-              delta_fc2: [B, hidden_size, mlp_hidden]
+            list of (A_fc1, B_fc1, A_fc2, B_fc2) tuples, length = num_layers
+              A_fc1: [B, r, hidden_size]
+              B_fc1: [B, mlp_hidden, r]
+              A_fc2: [B, r, mlp_hidden]
+              B_fc2: [B, hidden_size, r]
+
+            HyperNetMlp consumes these factors directly via LoRA-style
+            decomposed matmul, avoiding the [B, M, H] delta materialization.
         """
         feat = self.trunk(task_vec)  # [B, task_emb_dim]
         r, H, M = self.rank, self.hidden_size, self.mlp_hidden
-        deltas = []
+        factors = []
         for head in self.heads:
             raw = head(feat)  # [B, 2*r*(H+M)]
             offset = 0
@@ -512,8 +517,13 @@ class HyperNet(nn.Module):
             B_fc1 = raw[:, offset:offset + M * r].view(-1, M, r); offset += M * r
             A_fc2 = raw[:, offset:offset + r * M].view(-1, r, M); offset += r * M
             B_fc2 = raw[:, offset:offset + H * r].view(-1, H, r); offset += H * r
-            deltas.append((B_fc1 @ A_fc1, B_fc2 @ A_fc2))  # ([B,M,H], [B,H,M])
-        return deltas
+            factors.append((A_fc1, B_fc1, A_fc2, B_fc2))
+        return factors
+
+    @staticmethod
+    def materialize_delta(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """诊断用：从因子展开成完整 delta 矩阵 B @ A。"""
+        return B @ A
 
 
 class HyperNetMlp(nn.Module):
@@ -544,30 +554,45 @@ class HyperNetMlp(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        delta_fc1: torch.Tensor | None = None,
-        delta_fc2: torch.Tensor | None = None,
+        A_fc1: torch.Tensor | None = None,
+        B_fc1: torch.Tensor | None = None,
+        A_fc2: torch.Tensor | None = None,
+        B_fc2: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
+        LoRA-style efficient forward:
+          x @ (W + B@A)^T  =  x @ W^T  +  (x @ A^T) @ B^T
+
+        基础路径用 F.linear（cuBLAS GEMM），LoRA 修正路径用两次小 einsum，
+        避免拼出 [B, M, H] 的完整权重矩阵。
+
         Args:
-            x:          [B, T, H]
-            delta_fc1:  [B, M, H]  per-sample weight delta for fc1
-            delta_fc2:  [B, H, M]  per-sample weight delta for fc2
+            x:     [B, T, H]
+            A_fc1: [B, r, H]    B_fc1: [B, M, r]
+            A_fc2: [B, r, M]    B_fc2: [B, H, r]
         """
-        if delta_fc1 is not None:
-            # w1[b] = fc1.weight + delta_fc1[b],  shape [M, H]
-            # einsum: h = x @ w1.T + bias  →  'bth,bmh->btm'
-            w1 = self.fc1.weight.unsqueeze(0) + delta_fc1  # [B, M, H]
-            h = torch.einsum("bth,bmh->btm", x, w1) + self.fc1.bias
-        else:
-            h = self.fc1(x)
+        # ---- fc1: x @ (W_fc1 + B_fc1@A_fc1)^T ----
+        h = self.fc1(x)  # [B, T, M] 基础路径
+        if A_fc1 is not None and B_fc1 is not None:
+            # x [B,T,H] @ A_fc1^T [B,H,r] -> [B, T, r]
+            lora = torch.einsum("bth,brh->btr", x, A_fc1)
+            # [B,T,r] @ B_fc1^T [B,r,M] -> [B, T, M]
+            lora = torch.einsum("btr,bmr->btm", lora, B_fc1)
+            h = h + lora
+
         h = self.act(h)
         h = self.drop1(h)
         h = self.norm(h)
-        if delta_fc2 is not None:
-            w2 = self.fc2.weight.unsqueeze(0) + delta_fc2  # [B, H, M]
-            out = torch.einsum("btm,bhm->bth", h, w2) + self.fc2.bias
-        else:
-            out = self.fc2(h)
+
+        # ---- fc2: h @ (W_fc2 + B_fc2@A_fc2)^T ----
+        out = self.fc2(h)  # [B, T, H] 基础路径
+        if A_fc2 is not None and B_fc2 is not None:
+            # h [B,T,M] @ A_fc2^T [B,M,r] -> [B, T, r]
+            lora = torch.einsum("btm,brm->btr", h, A_fc2)
+            # [B,T,r] @ B_fc2^T [B,r,H] -> [B, T, H]
+            lora = torch.einsum("btr,bhr->bth", lora, B_fc2)
+            out = out + lora
+
         return self.drop2(out)
 
 
@@ -588,11 +613,13 @@ class HyperNetTransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        delta_fc1: torch.Tensor | None = None,
-        delta_fc2: torch.Tensor | None = None,
+        A_fc1: torch.Tensor | None = None,
+        B_fc1: torch.Tensor | None = None,
+        A_fc2: torch.Tensor | None = None,
+        B_fc2: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x), delta_fc1, delta_fc2)
+        x = x + self.mlp(self.norm2(x), A_fc1, B_fc1, A_fc2, B_fc2)
         return x
 
 
@@ -670,8 +697,10 @@ class SmolVLMActionTransformerV2(nn.Module):
             nn.init.zeros_(head.bias)
 
         # Diagnostic caches (detached, no grad)
+        # last_factors: list of (A_fc1, B_fc1, A_fc2, B_fc2) tuples
+        # 用 factors 比 deltas 省 ~1000x 显存（rank=4 时）
         self.last_task_vec: torch.Tensor | None = None
-        self.last_deltas: list | None = None
+        self.last_factors: list | None = None
 
     def forward(
         self,
@@ -683,13 +712,13 @@ class SmolVLMActionTransformerV2(nn.Module):
     ) -> torch.Tensor:
         B, num_actions = action_with_noise.shape[:2]
 
-        # ---- HyperNet path: generate per-layer weight deltas ----
+        # ---- HyperNet path: 生成 LoRA 因子 (A, B)，不展开成完整 delta ----
         task_vec = vlm_features.mean(dim=1)  # [B, D_vlm]
-        deltas = self.hypernet(task_vec)      # list of (delta_fc1, delta_fc2)
+        factors = self.hypernet(task_vec)    # list of (A_fc1, B_fc1, A_fc2, B_fc2)
 
-        # Cache for training diagnostics (detached)
+        # 诊断缓存（仅存因子，detached）
         self.last_task_vec = task_vec.detach()
-        self.last_deltas = [(d1.detach(), d2.detach()) for d1, d2 in deltas]
+        self.last_factors = [tuple(f.detach() for f in tup) for tup in factors]
 
         # ---- Encode action tokens ----
         time_emb = timestep_embedding(t, self.dim_time)
@@ -706,9 +735,9 @@ class SmolVLMActionTransformerV2(nn.Module):
             raise ValueError(f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}.")
         x = x + self.pos_emb[:, :seq_len, :]
 
-        # ---- Transformer blocks with HyperNet weight modulation ----
-        for block, (d_fc1, d_fc2) in zip(self.blocks, deltas):
-            x = block(x, d_fc1, d_fc2)
+        # ---- Transformer blocks with LoRA-style weight modulation ----
+        for block, (A1, B1, A2, B2) in zip(self.blocks, factors):
+            x = block(x, A1, B1, A2, B2)
 
         action_feats = self.norm(x[:, :num_actions])   # [B, T_action, H]
         velocity = self.action_decoder(action_feats)    # [B, T_action, dim_action]
