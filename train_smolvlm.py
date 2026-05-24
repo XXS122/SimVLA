@@ -94,11 +94,13 @@ def get_args_parser():
                              "(default: $SIMVLA_SMOLVLM_MODEL)")
 
     # Data
+    # $SIMVLA_TRAIN_METAS 指向由 create_libero_meta.py 生成的 JSON 元数据文件
+    # $LIBERO_DATASETS 指向原始 HDF5 数据集目录，两者不同
     parser.add_argument("--train_metas_path", type=str,
-                        default=os.environ.get("LIBERO_DATASETS", None),
-                        required=os.environ.get("LIBERO_DATASETS") is None,
-                        help="Path to training metadata "
-                             "(default: $LIBERO_DATASETS)")
+                        default=os.environ.get("SIMVLA_TRAIN_METAS", None),
+                        required=os.environ.get("SIMVLA_TRAIN_METAS") is None,
+                        help="Path to training metadata JSON "
+                             "(default: $SIMVLA_TRAIN_METAS)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--image_size", type=int, default=384, 
                         help="Image size for SmolVLM (default: 384, can be 384 or 512)")
