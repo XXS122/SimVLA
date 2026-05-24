@@ -79,19 +79,26 @@ def get_args_parser():
     parser = argparse.ArgumentParser("SmolVLM-VLA Training", add_help=False)
 
     # I/O
-    parser.add_argument("--models", type=str, default=None, 
-                        help="Path to pretrained SmolVLM-VLA checkpoint (optional)")
-    parser.add_argument("--output_dir", type=str, default="runnings_smolvlm", 
+    parser.add_argument("--models", type=str,
+                        default=os.environ.get("SIMVLA_CHECKPOINTS", None),
+                        help="Path to pretrained SmolVLM-VLA checkpoint "
+                             "(default: $SIMVLA_CHECKPOINTS)")
+    parser.add_argument("--output_dir", type=str, default="runnings_smolvlm",
                         help="Directory to save checkpoints")
 
     # SmolVLM backbone
-    parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="Path or HF repo for SmolVLM backbone")
-    
+    parser.add_argument("--smolvlm_model_path", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
+                        help="Path or HF repo for SmolVLM backbone "
+                             "(default: $SIMVLA_SMOLVLM_MODEL)")
+
     # Data
-    parser.add_argument("--train_metas_path", type=str, required=True, 
-                        help="Path to training metadata")
+    parser.add_argument("--train_metas_path", type=str,
+                        default=os.environ.get("LIBERO_DATASETS", None),
+                        required=os.environ.get("LIBERO_DATASETS") is None,
+                        help="Path to training metadata "
+                             "(default: $LIBERO_DATASETS)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--image_size", type=int, default=384, 
                         help="Image size for SmolVLM (default: 384, can be 384 or 512)")

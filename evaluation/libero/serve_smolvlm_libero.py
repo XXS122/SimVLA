@@ -299,13 +299,19 @@ async def serve(host: str, port: int):
 
 def main():
     parser = argparse.ArgumentParser(description="SimVLA LIBERO Server (WebSocket)")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to SimVLA checkpoint")
+    _default_ckpt = os.environ.get("SIMVLA_CHECKPOINTS", None)
+    parser.add_argument("--checkpoint", type=str,
+                        default=_default_ckpt,
+                        required=_default_ckpt is None,
+                        help="Path to SimVLA checkpoint "
+                             "(default: $SIMVLA_CHECKPOINTS)")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
     parser.add_argument("--smolvlm_model", type=str,
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="SmolVLM model path or HuggingFace repo")
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
+                        help="SmolVLM model path or HuggingFace repo "
+                             "(default: $SIMVLA_SMOLVLM_MODEL)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--use_psca", action="store_true", default=False,
