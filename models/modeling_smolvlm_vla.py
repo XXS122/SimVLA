@@ -82,10 +82,12 @@ class SmolVLMVLA(PreTrainedModel):
         vlm_hidden_size = self.vlm.config.text_config.hidden_size
         logging.info(f"SmolVLM hidden size: {vlm_hidden_size}")
 
-        # DiT/AdaLN mode setting
-        self.use_adaln = getattr(config, 'use_adaln', False)
-        
-        # Flow matching action head (SmolVLM version - no aux_visual)
+        # Mode flags
+        self.use_adaln  = getattr(config, 'use_adaln',  False)
+        self.use_ctaf   = getattr(config, 'use_ctaf',   False)
+        self.use_psca   = getattr(config, 'use_psca',   False)
+
+        # Flow matching action head
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
             vlm_hidden_size=vlm_hidden_size,
@@ -97,12 +99,21 @@ class SmolVLMVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
+            use_ctaf=self.use_ctaf,
+            num_fourier_freqs=getattr(config, 'num_fourier_freqs', 5),
+            use_psca=self.use_psca,
+            psca_rank=getattr(config, 'psca_rank', 8),
         )
-        
-        if self.use_adaln:
-            logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
-        else:
-            logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
+
+        mode_tags = []
+        if self.use_adaln:  mode_tags.append("AdaLN")
+        if self.use_ctaf:   mode_tags.append("CTAF")
+        if self.use_psca:   mode_tags.append("PSCA")
+        logging.info(f"✓ Transformer modes: {', '.join(mode_tags) or 'concat (baseline)'}")
+
+        # Cache for PSCA inference-time adaptation
+        self._last_vlm_features: torch.Tensor | None = None
+        self._last_proprio_norm: torch.Tensor | None = None
 
         # Deferred FastAPI app
         self.app: FastAPI | None = None
@@ -418,27 +429,99 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
+        # Cache for PSCA adapt_step (next call can use these)
+        self._last_vlm_features = enc["vlm_features"].detach()
+        self._last_proprio_norm = proprio_norm.detach()
+
         # Euler integration
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
+
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
+
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
+
+    def adapt_step(
+        self,
+        vlm_features: torch.Tensor,
+        proprio_norm: torch.Tensor,
+        actual_next_proprio: torch.Tensor,
+        psca_lr: float = 5e-4,
+    ) -> float:
+        """
+        PSCA 推理时在线适应。
+
+        用"预测下一 proprio"与"实际观测 proprio"的一致性误差，
+        对 LoRA 参数做一步梯度更新（约 0.2% 参数，主体权重不动）。
+
+        参数：
+          vlm_features      — 上一步的 VLM 特征 [B, T_vlm, D]
+          proprio_norm      — 上一步已归一化的本体感知 [B, dim_proprio]
+          actual_next_proprio — 当前观测到的原始本体感知 [B, dim_proprio]
+          psca_lr           — LoRA 更新学习率
+        """
+        if not self.use_psca:
+            return 0.0
+
+        psca_params = [p for n, p in self.transformer.named_parameters() if 'lora_' in n]
+        if not psca_params:
+            return 0.0
+
+        # 归一化目标 proprio
+        if hasattr(self.action_space, 'normalize_state'):
+            target = self.action_space.normalize_state(actual_next_proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            target = self.action_space.normalize(actual_next_proprio)
+        else:
+            target = actual_next_proprio
+        target = target.detach()
+
+        B = vlm_features.shape[0]
+        device = vlm_features.device
+        dtype = vlm_features.dtype
+
+        for p in psca_params:
+            p.requires_grad_(True)
+
+        with torch.enable_grad():
+            # t=0：模拟干净动作（推理结束状态）
+            dummy_x = torch.zeros(B, self.num_actions, self.action_space.dim_action,
+                                  device=device, dtype=dtype)
+            t_zero = torch.zeros(B, device=device, dtype=dtype)
+
+            _, action_feats = self.transformer(
+                vlm_features=vlm_features,
+                action_with_noise=dummy_x,
+                proprio=proprio_norm,
+                t=t_zero,
+                return_features=True,
+            )
+
+            # 物理一致性误差
+            pred_next = self.transformer.state_pred_head(action_feats.mean(dim=1))
+            loss = torch.nn.functional.mse_loss(pred_next, target)
+
+            grads = torch.autograd.grad(loss, psca_params, create_graph=False)
+
+        with torch.no_grad():
+            for p, g in zip(psca_params, grads):
+                p.data.add_(g, alpha=-psca_lr)
+
+        return loss.item()
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):

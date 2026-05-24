@@ -145,7 +145,7 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
-    
+
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
                         help="Hidden size for action transformer")
@@ -153,6 +153,18 @@ def get_args_parser():
                         help="Number of transformer layers")
     parser.add_argument("--num_heads", type=int, default=12,
                         help="Number of attention heads")
+
+    # CTAF: Continuous-Time Action Field
+    parser.add_argument("--use_ctaf", action="store_true", default=False,
+                        help="Use CTAF Fourier coefficient action decoder")
+    parser.add_argument("--num_fourier_freqs", type=int, default=5,
+                        help="Number of Fourier frequencies for CTAF (M; output 2M-1 coefficients)")
+
+    # PSCA: Physical Self-Consistency Adaptation
+    parser.add_argument("--use_psca", action="store_true", default=False,
+                        help="Use PSCA LoRA adapters for inference-time adaptation")
+    parser.add_argument("--psca_rank", type=int, default=8,
+                        help="LoRA rank for PSCA MLP adapters")
 
     return parser
 
@@ -170,21 +182,30 @@ def set_seed(seed: int):
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
     """Build optimizer with separate param groups."""
     vlm_params = list(model.vlm.parameters())
-    
+
     # Get action output params based on mode
     if hasattr(model.transformer, 'final_layer'):
         action_params = list(model.transformer.final_layer.parameters()) + list(model.transformer.action_encoder.parameters())
+    elif hasattr(model.transformer, 'coeff_decoder'):
+        action_params = list(model.transformer.coeff_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
     else:
         action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
-    
-    exclude = set(map(id, vlm_params + action_params))
+
+    # PSCA LoRA params — always trained, even during freeze phase
+    psca_lora_params = [p for n, p in model.transformer.named_parameters() if 'lora_' in n]
+    psca_lora_ids = set(map(id, psca_lora_params))
+
+    exclude = set(map(id, vlm_params + action_params)) | psca_lora_ids
     transformer_core_params = [p for p in model.parameters() if id(p) not in exclude]
-    
+
     param_groups = [
-        {"name": "vlm", "params": vlm_params, "lr": 0.0, "weight_decay": weight_decay},
+        {"name": "vlm",              "params": vlm_params,              "lr": 0.0, "weight_decay": weight_decay},
         {"name": "transformer_core", "params": transformer_core_params, "lr": 0.0, "weight_decay": weight_decay},
-        {"name": "action_heads", "params": action_params, "lr": lr, "weight_decay": weight_decay},
+        {"name": "action_heads",     "params": action_params,           "lr": lr,  "weight_decay": weight_decay},
     ]
+    if psca_lora_params:
+        param_groups.append({"name": "psca_lora", "params": psca_lora_params, "lr": lr, "weight_decay": 0.0})
+
     return AdamW(param_groups, betas=betas)
 
 
@@ -219,18 +240,21 @@ def update_group_lrs(optim, step, args):
         "vlm": args.learning_rate * args.learning_coef,
         "transformer_core": args.learning_rate,
         "action_heads": args.learning_rate,
+        "psca_lora": args.learning_rate,
     }
-    
+
     def schedule(step, base_lr):
         return linear_warmup_cosine(
-            step, args.freeze_steps, args.warmup_steps, 
+            step, args.freeze_steps, args.warmup_steps,
             args.iters, base_lr, args.min_lr_ratio
         )
-    
+
     if step < args.freeze_steps:
         set_group_lr(optim, "vlm", 0.0)
         set_group_lr(optim, "transformer_core", 0.0)
         set_group_lr(optim, "action_heads", base["action_heads"])
+        # psca_lora 在冻结阶段也保持活跃
+        set_group_lr(optim, "psca_lora", base["psca_lora"])
     else:
         for name, base_lr in base.items():
             new_lr = schedule(step, base_lr) if args.use_cosine_decay else base_lr
@@ -341,6 +365,10 @@ def main(args):
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
             image_size=args.image_size,
+            use_ctaf=args.use_ctaf,
+            num_fourier_freqs=args.num_fourier_freqs,
+            use_psca=args.use_psca,
+            psca_rank=args.psca_rank,
         )
         model = SmolVLMVLA(config)
         

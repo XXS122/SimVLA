@@ -50,28 +50,37 @@ model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Per-connection PSCA state: conn_id -> {"vlm_features": Tensor, "proprio_norm": Tensor}
+_psca_state: Dict[int, Any] = {}
+
 # Configuration
 CONFIG = {
     "state_dim": 8,
     "action_dim": 7,
     "action_horizon": 10,
     "image_size": 384,
+    "use_psca": False,
+    "psca_lr": 5e-4,
 }
 
 
-def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
+def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None,
+               use_psca: bool = False, psca_lr: float = 5e-4):
     """Load SimVLA model and processor."""
     global model, processor
-    
+
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
-    
+
     model = SmolVLMVLA.from_pretrained(checkpoint_path)
     model = model.to(device)
     model.eval()
-    
+
+    CONFIG["use_psca"] = use_psca
+    CONFIG["psca_lr"] = psca_lr
+
     smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
-    
+
     if norm_stats_path and os.path.exists(norm_stats_path):
         logger.info(f"Loading norm stats from: {norm_stats_path}")
         model.action_space.load_norm_stats(norm_stats_path)
@@ -81,8 +90,9 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
             logger.info(f"   Action norm: mean={model.action_space.action_norm_stats.mean[:3].tolist()}")
     else:
         logger.warning("No norm_stats loaded!")
-    
-    logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
+
+    psca_flag = "enabled" if use_psca else "disabled"
+    logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}, PSCA: {psca_flag}")
 
 
 def preprocess_images(image0: np.ndarray, image1: np.ndarray):
@@ -133,22 +143,22 @@ def decode_numpy(obj):
     return obj
 
 
-def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
+def infer(observation: Dict[str, Any], conn_id: int = 0) -> Dict[str, Any]:
     """Run inference on a single observation."""
-    global model, processor
-    
+    global model, processor, _psca_state
+
     try:
         # Extract observation fields
         image0 = observation.get("observation/image")
         image1 = observation.get("observation/wrist_image")
         state = observation.get("observation/state", np.zeros(8))
         prompt = observation.get("prompt", "")
-        
+
         # Decode msgpack_numpy format if needed
         image0 = decode_numpy(image0)
         image1 = decode_numpy(image1)
         state = decode_numpy(state)
-        
+
         # Ensure numpy arrays
         if not isinstance(image0, np.ndarray):
             image0 = np.array(image0, dtype=np.uint8)
@@ -156,23 +166,35 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             image1 = np.array(image1, dtype=np.uint8)
         if not isinstance(state, np.ndarray):
             state = np.array(state, dtype=np.float32)
-        
+
         if len(state) < 8:
             state = np.pad(state, (0, 8 - len(state)))
         state = state[:8]
-        
+
         # Preprocess images
         images, image_mask = preprocess_images(image0, image1)
         images = images.to(device)
         image_mask = image_mask.to(device)
-        
+
         # Encode language instruction
         lang = processor.encode_language([prompt])
         lang = {k: v.to(device) for k, v in lang.items()}
-        
+
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        
+
+        # PSCA: 用上一步的缓存做在线适应
+        use_psca = CONFIG.get("use_psca", False)
+        if use_psca and conn_id in _psca_state:
+            prev = _psca_state[conn_id]
+            adapt_loss = model.adapt_step(
+                vlm_features=prev["vlm_features"],
+                proprio_norm=prev["proprio_norm"],
+                actual_next_proprio=proprio_tensor,
+                psca_lr=CONFIG.get("psca_lr", 5e-4),
+            )
+            logger.debug(f"PSCA adapt loss: {adapt_loss:.6f}")
+
         # Inference
         with torch.no_grad():
             actions = model.generate_actions(
@@ -182,11 +204,22 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
                 proprio=proprio_tensor,
                 steps=CONFIG["action_horizon"],
             )
-        
+
+        # PSCA: 缓存本步的 VLM 特征和归一化 proprio，供下一步使用
+        if use_psca and model._last_vlm_features is not None:
+            if hasattr(model.action_space, 'normalize_state'):
+                proprio_norm_cached = model.action_space.normalize_state(proprio_tensor).detach()
+            else:
+                proprio_norm_cached = proprio_tensor.detach()
+            _psca_state[conn_id] = {
+                "vlm_features": model._last_vlm_features,
+                "proprio_norm": proprio_norm_cached,
+            }
+
         actions = actions.cpu().numpy()[0]
-        
+
         return {"actions": actions}
-        
+
     except Exception as e:
         logger.error(f"Inference error: {e}")
         traceback.print_exc()
@@ -195,8 +228,9 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
 
 async def handle_connection(websocket, path=None):
     """Handle a WebSocket connection."""
-    logger.info(f"Connection from {websocket.remote_address} opened")
-    
+    conn_id = id(websocket)
+    logger.info(f"Connection from {websocket.remote_address} opened (id={conn_id})")
+
     try:
         # Send server metadata on connection
         metadata = {
@@ -210,7 +244,7 @@ async def handle_connection(websocket, path=None):
         else:
             import json
             await websocket.send(json.dumps(metadata))
-        
+
         # Process requests
         async for message in websocket:
             try:
@@ -220,36 +254,38 @@ async def handle_connection(websocket, path=None):
                 else:
                     import json
                     request = json.loads(message)
-                
-                # Run inference
-                result = infer(request)
-                
+
+                # Run inference (pass conn_id for per-connection PSCA state)
+                result = infer(request, conn_id=conn_id)
+
                 # Send response (convert numpy to list for compatibility)
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
-                
+
                 response_data = {"actions": actions}
-                
+
                 if HAS_MSGPACK:
                     import msgpack
                     response = msgpack.packb(response_data, use_bin_type=True)
                 else:
                     import json
                     response = json.dumps(response_data)
-                
+
                 await websocket.send(response)
-                
+
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 traceback.print_exc()
                 error_msg = f"Error: {str(e)}"
                 await websocket.send(error_msg)
-                
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        logger.info(f"Connection from {websocket.remote_address} closed")
+        # 清理该连接的 PSCA 缓存
+        _psca_state.pop(conn_id, None)
+        logger.info(f"Connection from {websocket.remote_address} closed (id={conn_id})")
 
 
 async def serve(host: str, port: int):
@@ -267,18 +303,23 @@ def main():
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str, 
+    parser.add_argument("--smolvlm_model", type=str,
                         default="HuggingFaceTB/SmolVLM-500M-Instruct",
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    
+    parser.add_argument("--use_psca", action="store_true", default=False,
+                        help="Enable PSCA inference-time online adaptation")
+    parser.add_argument("--psca_lr", type=float, default=5e-4,
+                        help="Learning rate for PSCA LoRA online update")
+
     args = parser.parse_args()
-    
+
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-    
-    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
+
+    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model,
+               use_psca=args.use_psca, psca_lr=args.psca_lr)
     
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")

@@ -46,7 +46,15 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
-        
+
+        # === CTAF: Continuous-Time Action Field ===
+        use_ctaf: bool = False,
+        num_fourier_freqs: int = 5,   # M frequencies; output has (2M-1)*dim_action coefficients
+
+        # === PSCA: Physical Self-Consistency Adaptation ===
+        use_psca: bool = False,
+        psca_rank: int = 8,           # LoRA rank for each MLP layer
+
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views
@@ -71,7 +79,15 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
-        
+
+        # CTAF settings
+        self.use_ctaf = use_ctaf
+        self.num_fourier_freqs = num_fourier_freqs
+
+        # PSCA settings
+        self.use_psca = use_psca
+        self.psca_rank = psca_rank
+
         # Image settings
         self.image_size = image_size
         self.num_views = num_views

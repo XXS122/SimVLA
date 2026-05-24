@@ -6,6 +6,12 @@ Key difference from the original transformer:
   - No aux_visual_inputs: all views are processed together by SmolVLM
   - VLM outputs a single unified feature for all views
   - Simpler architecture: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
+
+Extensions:
+  - CTAF (use_ctaf=True): output Fourier coefficients instead of discrete action tokens,
+    guaranteeing C∞ smooth trajectories at zero extra parameter cost.
+  - PSCA (use_psca=True): each MLP block gets LoRA adapters (B=0 init → delta=0 at start),
+    enabling inference-time physical self-consistency adaptation via adapt_step().
 """
 
 from __future__ import annotations
@@ -157,6 +163,112 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torc
     return embedding
 
 
+# ========================= CTAF utility ======================================
+
+def query_fourier(coeff: torch.Tensor, T: int, num_freqs: int) -> torch.Tensor:
+    """
+    Reconstruct a trajectory from Fourier coefficients at T evenly-spaced points.
+
+    Layout of coeff along dim-1:
+      index 0        : DC component  (c₀)
+      index 2k-1     : cos coefficient for frequency k  (k = 1 … num_freqs-1)
+      index 2k       : sin coefficient for frequency k
+
+    a(τ) = c₀ + Σₖ₌₁^{M-1} [ c_cos_k · cos(2πkτ) + c_sin_k · sin(2πkτ) ]
+
+    Args:
+        coeff:     [B, 2*num_freqs-1, D]
+        T:         number of output time steps
+        num_freqs: M (total frequency count including DC)
+    Returns:
+        [B, T, D]
+    """
+    device, dtype = coeff.device, coeff.dtype
+    tau = torch.linspace(0.0, 1.0, T, device=device, dtype=dtype)  # [T]
+    n_coeff = 2 * num_freqs - 1
+
+    # Build Fourier basis matrix [T, n_coeff]
+    basis = torch.empty(T, n_coeff, device=device, dtype=dtype)
+    basis[:, 0] = 1.0
+    for k in range(1, num_freqs):
+        basis[:, 2 * k - 1] = torch.cos(2.0 * math.pi * k * tau)
+        basis[:, 2 * k]     = torch.sin(2.0 * math.pi * k * tau)
+
+    return torch.einsum("tn,bnd->btd", basis, coeff)  # [B, T, D]
+
+
+# ========================= PSCA building blocks ==============================
+
+class PSCAMlp(nn.Module):
+    """
+    MLP with per-layer LoRA adapters for Physical Self-Consistency Adaptation.
+
+    LoRA delta: ΔW = B @ A  (initialized to 0 because B = 0 at start).
+    During training the adapters are optimized jointly with the base weights.
+    During inference adapt_step() updates only A/B params via the physical
+    consistency error, leaving the base weights (fc1/fc2) unchanged.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        drop: float | Tuple[float, float] = 0.0,
+        psca_rank: int = 8,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        drop_probs = _to_2tuple(drop)
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.GELU(approximate="tanh")
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+        # LoRA: A uses kaiming init, B is zero → delta = B@A = 0 at start
+        self.lora_A1 = nn.Parameter(torch.empty(psca_rank, in_features))
+        self.lora_B1 = nn.Parameter(torch.zeros(hidden_features, psca_rank))
+        self.lora_A2 = nn.Parameter(torch.empty(psca_rank, hidden_features))
+        self.lora_B2 = nn.Parameter(torch.zeros(out_features, psca_rank))
+        nn.init.kaiming_uniform_(self.lora_A1, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_A2, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # fc1 + LoRA delta
+        h = self.fc1(x) + F.linear(F.linear(x, self.lora_A1), self.lora_B1)
+        h = self.act(h)
+        h = self.drop1(h)
+        # fc2 + LoRA delta
+        out = self.fc2(h) + F.linear(F.linear(h, self.lora_A2), self.lora_B2)
+        return self.drop2(out)
+
+
+class PSCATransformerBlock(nn.Module):
+    """TransformerBlock (pre-LN) whose MLP has PSCA LoRA adapters."""
+
+    def __init__(
+        self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, psca_rank: int = 8
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
+        self.mlp = PSCAMlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            drop=0.1,
+            psca_rank=psca_rank,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
 # ------------------------------- Core Layers ----------------------------------
 
 class TransformerBlock(nn.Module):
@@ -192,22 +304,22 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        
+
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        
+
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
         self.mlp = Mlp(
             in_features=hidden_size,
             hidden_features=int(hidden_size * mlp_ratio),
             drop=0.1,
         )
-        
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
-        
+
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
@@ -216,19 +328,19 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             modulation_params.chunk(6, dim=-1)
         )
-        
+
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(x_norm)
-        
+
         x_norm = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
-        
+
         return x
 
 
 class FinalLayer(nn.Module):
     """DiT Final Layer with AdaLN."""
-    
+
     def __init__(self, hidden_size: int, out_dim: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -237,12 +349,12 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
         self.linear = nn.Linear(hidden_size, out_dim, bias=True)
-        
+
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.linear.weight, 0)
         nn.init.constant_(self.linear.bias, 0)
-    
+
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift, scale)
@@ -255,20 +367,19 @@ class SmolVLMActionTransformer(nn.Module):
     """
     Flow Matching Transformer for action prediction - SmolVLM Version.
 
-    Key difference from ActionTransformer:
-      - No aux_visual_inputs: SmolVLM processes all views together
-      - Simpler forward: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-      - Only one visual input stream
-    
-    Supports two modes:
-    - Concat mode (use_adaln=False): Original architecture
-    - AdaLN mode (use_adaln=True): DiT style conditioning
+    Supports four concat-mode variants (use_adaln=False):
+      use_ctaf=False, use_psca=False : original architecture
+      use_ctaf=True,  use_psca=False : CTAF — Fourier coefficient decoder, C∞ smooth output
+      use_ctaf=False, use_psca=True  : PSCA — LoRA adapters in each MLP block
+      use_ctaf=True,  use_psca=True  : CTAF + PSCA combined
+
+    AdaLN mode (use_adaln=True) is unchanged — CTAF/PSCA do not apply there.
     """
 
     def __init__(
         self,
         hidden_size: int = 768,
-        vlm_hidden_size: int = 576,  # Will be overridden by actual model config
+        vlm_hidden_size: int = 576,
         depth: int = 12,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
@@ -277,6 +388,12 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        # --- CTAF ---
+        use_ctaf: bool = False,
+        num_fourier_freqs: int = 5,
+        # --- PSCA ---
+        use_psca: bool = False,
+        psca_rank: int = 8,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -284,121 +401,122 @@ class SmolVLMActionTransformer(nn.Module):
         self.dim_time = dim_time
         self.dim_propio = dim_propio
         self.use_adaln = use_adaln
+        self.use_ctaf = use_ctaf
+        self.num_fourier_freqs = num_fourier_freqs
+        self.use_psca = use_psca
 
         if use_adaln:
-            # ========== DiT Mode: AdaLN ==========
+            # ========== DiT Mode: AdaLN (CTAF/PSCA not applied) ==========
             self.blocks = nn.ModuleList(
                 [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
             )
-            
-            # Condition encoders
             self.time_proj = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
                 nn.SiLU(),
                 nn.Linear(hidden_size, hidden_size),
             )
-            # VLM pooling projection (no aux_visual needed)
             self.vlm_cond_proj = nn.Linear(vlm_hidden_size, hidden_size)
-            # Proprio projection
             self.proprio_proj = nn.Linear(dim_propio, hidden_size)
-            
-            # Action encoder
             self.action_encoder = nn.Linear(dim_action, hidden_size)
-            
-            # Position encoding
             self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
             nn.init.normal_(self.pos_emb, std=0.02)
-            
-            # Final layer
             self.final_layer = FinalLayer(hidden_size, dim_action)
         else:
-            # ========== Concat Mode: Original architecture ==========
-            self.blocks = nn.ModuleList(
-                [TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
-            )
+            # ========== Concat Mode ==========
+            # Choose block type based on PSCA flag
+            if use_psca:
+                self.blocks = nn.ModuleList([
+                    PSCATransformerBlock(hidden_size, num_heads, mlp_ratio, psca_rank)
+                    for _ in range(depth)
+                ])
+            else:
+                self.blocks = nn.ModuleList([
+                    TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+                    for _ in range(depth)
+                ])
 
-            # VLM projection only (no aux_visual_proj needed for SmolVLM)
             self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
-
             self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
             nn.init.normal_(self.pos_emb, std=0.02)
-
             self.norm = nn.LayerNorm(hidden_size)
-            
-            # Action encoder/decoder
+
             action_input_dim = dim_action + dim_time + dim_propio
             self.action_encoder = nn.Linear(action_input_dim, hidden_size)
-            self.action_decoder = nn.Linear(hidden_size, dim_action)
+
+            # Output decoder: CTAF (Fourier coefficients) or standard per-token
+            if use_ctaf:
+                n_coeff = 2 * num_fourier_freqs - 1
+                self.coeff_decoder = nn.Linear(hidden_size, n_coeff * dim_action)
+            else:
+                self.action_decoder = nn.Linear(hidden_size, dim_action)
+
+        # Auxiliary world-model head: predicts next proprio state.
+        # Used for training with state_loss and for PSCA's self-supervised signal.
+        self.state_pred_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, dim_propio),
+        )
 
         self.apply(basic_init)
 
     def forward(
         self,
-        vlm_features: torch.Tensor,  # [B, T_vlm, D] - unified features from SmolVLM
+        vlm_features: torch.Tensor,  # [B, T_vlm, D]
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_features: bool = False,
     ) -> torch.Tensor:
-        """
-        Forward pass for SmolVLM Action Transformer.
-
-        Inputs
-        ------
-        vlm_features : [B, T_vlm, D] - Unified features from SmolVLM (all views processed together)
-        action_with_noise : [B, T_action, dim_action]
-        proprio : [B, dim_proprio]
-        t : [B]
-
-        Returns
-        -------
-        Tensor: Predicted velocity, [B, T_action, dim_action]
-        """
         if self.use_adaln:
             return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
         else:
-            return self._forward_concat(vlm_features, action_with_noise, proprio, t)
-    
+            return self._forward_concat(vlm_features, action_with_noise, proprio, t, return_features)
+
     def _forward_concat(
         self,
         vlm_features: torch.Tensor,
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_features: bool = False,
     ) -> torch.Tensor:
-        """
-        Concat mode forward pass.
-        
-        Simplified: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-        No aux_visual_inputs needed.
-        """
         B, num_actions = action_with_noise.shape[:2]
 
         # Encode (action + proprio + time) → tokens
         time_emb = timestep_embedding(t, self.dim_time)
         time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
         proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
-        
+
         action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
         x = self.action_encoder(action_tokens)  # [B, T_action, H]
 
-        # Project VLM features and concatenate (no aux_visual needed)
+        # Concat VLM tokens
         x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
 
-        # Add positional embeddings
         seq_len = x.shape[1]
         if seq_len > self.pos_emb.shape[1]:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}."
-            )
+            raise ValueError(f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}.")
         x = x + self.pos_emb[:, :seq_len, :]
 
-        # Transformer backbone
         for block in self.blocks:
             x = block(x)
 
-        # Decode only the action segment
-        return self.action_decoder(self.norm(x[:, :num_actions]))
-    
+        action_feats = self.norm(x[:, :num_actions])  # [B, T_action, H]
+
+        if self.use_ctaf:
+            # Pool action features → Fourier coefficients → query at T time points
+            feat = action_feats.mean(dim=1)  # [B, H]
+            n_coeff = 2 * self.num_fourier_freqs - 1
+            coeff = self.coeff_decoder(feat).view(B, n_coeff, self.dim_action)
+            velocity = query_fourier(coeff, num_actions, self.num_fourier_freqs)
+        else:
+            velocity = self.action_decoder(action_feats)  # [B, T_action, D]
+
+        if return_features:
+            return velocity, action_feats
+        return velocity
+
     def _forward_adaln(
         self,
         vlm_features: torch.Tensor,
@@ -406,48 +524,32 @@ class SmolVLMActionTransformer(nn.Module):
         proprio: torch.Tensor,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        DiT/AdaLN mode forward pass.
-        
-        Conditions (time, vlm, proprio) injected via AdaLN.
-        No aux_visual needed for SmolVLM.
-        """
         B, num_actions = action_with_noise.shape[:2]
-        
-        # ========== 1. Build global condition c ==========
-        # Time embedding
+
         t_emb = timestep_embedding(t, self.hidden_size)
-        t_emb = self.time_proj(t_emb)  # [B, H]
-        
-        # VLM condition: Global Average Pooling
-        vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
-        # Proprio condition
-        proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
-        # Fuse all conditions
-        c = t_emb + vlm_cond + proprio_cond  # [B, H]
-        
-        # ========== 2. Encode action sequence ==========
-        x = self.action_encoder(action_with_noise)  # [B, T_action, H]
-        
-        # Add position encoding
+        t_emb = self.time_proj(t_emb)
+        vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))
+        proprio_cond = self.proprio_proj(proprio)
+        c = t_emb + vlm_cond + proprio_cond
+
+        x = self.action_encoder(action_with_noise)
         x = x + self.pos_emb[:, :num_actions, :]
-        
-        # ========== 3. DiT Blocks with AdaLN ==========
+
         for block in self.blocks:
             x = block(x, c)
-        
-        # ========== 4. Final Layer with AdaLN ==========
+
         return self.final_layer(x, c)
 
 
 __all__ = [
     "SmolVLMActionTransformer",
     "TransformerBlock",
+    "PSCATransformerBlock",
+    "PSCAMlp",
     "DiTBlock",
     "FinalLayer",
     "Attention",
     "Mlp",
     "timestep_embedding",
+    "query_fourier",
 ]
