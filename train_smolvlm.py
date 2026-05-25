@@ -315,6 +315,18 @@ def main(args):
         kwargs_handlers=[ddp_kwargs]
     )
 
+    # 提前读取 state.json，获取 wandb run id（用于续训时接续 wandb run）
+    resume_wandb_id = None
+    if args.resume and args.models and os.path.isdir(args.models):
+        state_json = os.path.join(args.models, "state.json")
+        if os.path.exists(state_json):
+            try:
+                with open(state_json, "r") as f:
+                    _state = json.load(f)
+                    resume_wandb_id = _state.get("wandb_run_id", None)
+            except Exception:
+                pass
+
     # Initialize trackers
     tracker_config = {
         "learning_rate": args.learning_rate,
@@ -333,10 +345,14 @@ def main(args):
     }
     
     if use_wandb:
+        if resume_wandb_id:
+            wandb_init_kwargs = {"id": resume_wandb_id, "resume": "must"}
+        else:
+            wandb_init_kwargs = {"name": f"smolvlm-{time.strftime('%Y%m%d-%H%M%S')}"}
         accelerator.init_trackers(
             project_name=wandb_project,
             config=tracker_config,
-            init_kwargs={"wandb": {"name": f"smolvlm-{time.strftime('%Y%m%d-%H%M%S')}"}}
+            init_kwargs={"wandb": wandb_init_kwargs}
         )
     else:
         accelerator.init_trackers("SmolVLM-VLA-Training", config=tracker_config)
@@ -434,7 +450,6 @@ def main(args):
 
     # Diagnostic state
     loss_history: deque = deque(maxlen=100)  # for rolling std
-    best_velocity_loss = float("inf")
     last_delta_norm = 0.0
 
     # Training loop
@@ -448,8 +463,7 @@ def main(args):
                 with open(state_json, "r") as f:
                     state_data = json.load(f)
                     start_step = int(state_data.get("global_step", 0))
-                    best_velocity_loss = float(state_data.get("best_velocity_loss", float("inf")))
-                logger.info(f"Resuming from step: {start_step}, best_loss: {best_velocity_loss:.4f}")
+                logger.info(f"Resuming from step: {start_step}, wandb_run_id: {resume_wandb_id}")
             except Exception:
                 pass
 
@@ -457,11 +471,17 @@ def main(args):
         save_dir = os.path.join(output_dir, tag)
         accelerator.print(f"💾 Saving model to {save_dir}")
         accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+        wandb_run_id = None
+        if use_wandb and wandb is not None:
+            try:
+                wandb_run_id = wandb.run.id
+            except Exception:
+                pass
         with open(os.path.join(save_dir, "state.json"), "w") as f:
             json.dump({
                 "global_step": global_step,
-                "best_velocity_loss": best_velocity_loss,
                 "hypernet_mean_delta_norm": last_delta_norm,
+                "wandb_run_id": wandb_run_id,
             }, f)
 
     global_step, t0 = start_step, time.time()
@@ -514,12 +534,26 @@ def main(args):
         velocity_loss_val = loss_dict.get("velocity_loss", loss).detach().float().item()
         loss_history.append(velocity_loss_val)
 
+        # ---- Per-step diagnostics (collected before backward, cheap) ----
+        diag = {}
+        if global_step % args.log_interval == 0 and accelerator.is_main_process:
+            with torch.no_grad():
+                # action 各维度均值/方差（归一化前的原始值）
+                act = inputs["action"].float()  # [B, T, D]
+                for d in range(act.shape[-1]):
+                    diag[f"action_dim/mean_{d}"] = act[..., d].mean().item()
+                    diag[f"action_dim/std_{d}"] = act[..., d].std().item()
+                # proprio 均值/方差
+                prop = inputs["proprio"].float()  # [B, D]
+                diag["proprio/mean"] = prop.mean().item()
+                diag["proprio/std"] = prop.std().item()
+
         # Backward
         accelerator.backward(loss)
         if args.max_grad_norm:
             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-        # ---- Gradient norm diagnostics (before optimizer step) ----
+        # ---- Gradient norm diagnostics (after clip, before step) ----
         if global_step % args.log_interval == 0 and accelerator.is_main_process:
             grad_logs = {}
             for g in optim.param_groups:
@@ -527,6 +561,16 @@ def main(args):
                     p.grad.norm() ** 2 for p in g["params"] if p.grad is not None
                 ) ** 0.5
                 grad_logs[f"grad/{g['name']}_norm"] = gn.item()
+            # VLM 特征范数（每 500 步检测一次，避免额外 forward 开销）
+            if global_step % 500 == 0:
+                unwrapped = accelerator.unwrap_model(model)
+                with torch.no_grad():
+                    enc = unwrapped.forward_vlm_efficient(
+                        inputs["image_input"][:1], inputs["image_mask"][:1], inputs["input_ids"][:1]
+                    )
+                    vlm_feat = enc["vlm_features"].float()
+                    grad_logs["vlm/feature_norm_mean"] = vlm_feat.norm(dim=-1).mean().item()
+                    grad_logs["vlm/feature_norm_std"] = vlm_feat.norm(dim=-1).std().item()
         else:
             grad_logs = {}
 
@@ -542,6 +586,7 @@ def main(args):
             progress = global_step / max(args.iters, 1)
             logs["time_sampling/alpha"] = 1.0 if progress < 0.3 else (1.5 if progress < 0.7 else 2.5)
             logs.update(grad_logs)
+            logs.update(diag)
 
             # Loss rolling std (every 100 steps)
             if len(loss_history) >= 10:
@@ -620,15 +665,6 @@ def main(args):
         # ---- Checkpointing ----
         global_step += 1
         if accelerator.is_main_process:
-            # Early frequent saves (first 5000 steps)
-            if global_step < 5000 and global_step % 1000 == 0:
-                _save_ckpt(f"ckpt-{global_step}")
-
-            # Best checkpoint
-            if velocity_loss_val < best_velocity_loss:
-                best_velocity_loss = velocity_loss_val
-                _save_ckpt("ckpt-best")
-
             # Regular interval + final
             if global_step == args.iters or global_step % args.save_interval == 0:
                 _save_ckpt(f"ckpt-{global_step}")

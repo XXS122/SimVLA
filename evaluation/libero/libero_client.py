@@ -205,41 +205,44 @@ def eval_libero(
     seed: int = 7,
     video_out_path: str = "data/libero/videos",
     save_video: bool = True,
+    result_out_path: Optional[str] = None,
+    algo_name: str = "simvla",
 ) -> float:
     """
     Run LIBERO evaluation across all tasks in a suite.
     """
     np.random.seed(seed)
-    
+
     # Initialize task suite
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks = task_suite.n_tasks
     max_steps = MAX_STEPS.get(task_suite_name, 400)
-    
+
     Path(video_out_path).mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Task suite: {task_suite_name}")
     print(f"   Tasks: {num_tasks}, Trials per task: {num_trials}")
     print(f"   Max steps: {max_steps}")
-    
+
     total_episodes, total_successes = 0, 0
-    
+    task_results: List[Dict] = []
+
     for task_id in tqdm(range(num_tasks - 1, -1, -1), desc="Tasks"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
-        
+
         task_successes = 0
         for ep in tqdm(range(num_trials), desc=f"{task_description[:30]}...", leave=False):
             # Reset
             env.reset()
             client.reset()
             obs = env.set_init_state(initial_states[ep % len(initial_states)])
-            
+
             replay_images = []
             t = 0
             done = False
-            
+
             while t < max_steps + NUM_STEPS_WAIT:
                 try:
                     # Wait for objects to stabilize
@@ -247,14 +250,14 @@ def eval_libero(
                         obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                         t += 1
                         continue
-                    
+
                     # Get images (rotated 180 degrees)
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    
+
                     if save_video:
                         replay_images.append(img)
-                    
+
                     # Build state vector
                     # [eef_pos(3), axis_angle(3), gripper_qpos(2)] = 8D
                     state = np.concatenate([
@@ -262,50 +265,79 @@ def eval_libero(
                         _quat2axisangle(obs["robot0_eef_quat"]),
                         obs["robot0_gripper_qpos"],
                     ])
-                    
+
                     # Pack observation
                     obs_dict = {
                         "image": img,
                         "wrist_image": wrist_img,
                         "state": state,
                     }
-                    
+
                     # Get action (7D delta action)
                     action = client.step(obs_dict, task_description)
-                    
+
                     # Execute (send delta action directly)
                     obs, reward, done, info = env.step(action.tolist())
-                    
+
                     if done:
                         task_successes += 1
                         total_successes += 1
                         break
-                    
+
                     t += 1
-                    
+
                 except Exception as e:
                     print(f"Error in rollout: {e}")
                     break
 
             total_episodes += 1
-            
+
             # Save video
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")[:50]
             video_path = Path(video_out_path) / f"{task_segment}_ep{ep}_{suffix}.mp4"
             if replay_images and save_video:
                 imageio.mimwrite(str(video_path), replay_images, fps=10)
-            
+
             # Print episode result
             status_icon = "[OK]" if done else "[FAIL]"
             print(f"  {status_icon} Task {task_id} Ep {ep}: {suffix.upper()} (steps={t})")
 
         env.close()
-        print(f"   Task {task_id}: {task_successes}/{num_trials} ({task_successes/num_trials*100:.1f}%)")
-    
+        task_sr = task_successes / num_trials
+        print(f"   Task {task_id} [{task_description}]: {task_successes}/{num_trials} ({task_sr*100:.1f}%)")
+        task_results.append({
+            "task_id": task_id,
+            "task_name": task_description,
+            "successes": task_successes,
+            "trials": num_trials,
+            "success_rate": round(task_sr, 4),
+        })
+
     success_rate = total_successes / max(total_episodes, 1)
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
-    
+
+    # Save results to JSON
+    if result_out_path is not None:
+        Path(result_out_path).mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H")
+        filename = f"{algo_name}_{timestamp}.json"
+        result_file = Path(result_out_path) / filename
+        result_data = {
+            "algo": algo_name,
+            "task_suite": task_suite_name,
+            "num_trials": num_trials,
+            "seed": seed,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "total_successes": total_successes,
+            "total_episodes": total_episodes,
+            "total_success_rate": round(success_rate, 4),
+            "tasks": task_results,
+        }
+        with open(result_file, "w") as f:
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
+        print(f"Results saved to: {result_file}")
+
     return success_rate
 
 
@@ -327,6 +359,10 @@ def main():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--replan_steps", type=int, default=5)
     parser.add_argument("--video_out", type=str, default="./eval_results")
+    parser.add_argument("--result_out", type=str, default="./eval_results/results",
+                        help="Directory to save JSON result files")
+    parser.add_argument("--algo_name", type=str, default="simvla",
+                        help="Algorithm short name, used as JSON filename prefix")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
 
     args = parser.parse_args()
@@ -367,6 +403,8 @@ def main():
         seed=args.seed,
         video_out_path=str(video_path),
         save_video=not args.no_video,
+        result_out_path=args.result_out,
+        algo_name=args.algo_name,
     )
 
 

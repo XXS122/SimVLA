@@ -33,7 +33,7 @@ Download [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) dataset, an
 
 ```bash
 python create_libero_meta.py \
-    --data_dir ./datasets/metas \
+    --data_dir /datasets/liber-datasets/ \
     --subsets libero_10 libero_goal libero_object libero_spatial \
     --output ./datasets/metas/libero_train.json
 ```
@@ -42,7 +42,7 @@ python create_libero_meta.py \
 
 ```bash
 python compute_libero_norm_stats.py \
-    --data_dir ./datasets/metas \
+    --data_dir /datasets/liber-datasets/ \
     --subsets libero_10 libero_goal libero_object libero_spatial \
     --output ./norm_stats/libero_norm.json
 ```

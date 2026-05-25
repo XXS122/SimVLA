@@ -15,7 +15,7 @@ set -e
 BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
 OUTPUT_DIR=${3:-./runs/simvla_hypernet}
-RESUME_CKPT=${4:-""}
+RESUME_CKPT=${4:-${SIMVLA_RESUME_CKPT:-""}}
 
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
@@ -23,8 +23,12 @@ echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=0,1
+# GPU configuration（优先读取 paths.env，否则用默认值）
+if [ -f "paths.env" ]; then
+    source paths.env
+fi
+export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES:-0,1}
+NUM_PROCESSES=${NUM_GPUS:-2}
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -32,7 +36,7 @@ export TF_CPP_MIN_LOG_LEVEL=2
 # =============================================================================
 # Path configuration
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
+LIBERO_DATA_DIR=${LIBERO_DATASETS:-/datasets/liber-datasets}
 NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
 
@@ -157,7 +161,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=2 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

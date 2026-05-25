@@ -5,22 +5,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本文件为 Claude Code 在此仓库中工作提供指导。
 
 **重要：所有回答请使用中文。**
+## 文件权限
+```bash
+chown -R sapi:sapi /home/sapi/hyj/code/SimVLA/
+```
+## 环境安装
+
+### simvla 训练环境（Python 3.10）
+
+```bash
+conda create -n simvla python=3.10 -y
+conda activate simvla
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install transformers>=4.57.0
+pip install peft accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
+pip install flash-attn==2.5.6 --no-build-isolation
+pip install tensorflow tensorflow-datasets -i https://mirrors.aliyun.com/pypi/simple/
+```
+
+### libero 评估环境（Python 3.8，仅评估时需要）
+
+```bash
+conda create -n libero python=3.8.13 -y
+conda activate libero
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO
+pip install -r requirements.txt
+pip install torch==1.11.0+cu113 torchvision==0.12.0+cu113 torchaudio==0.11.0 \
+    --extra-index-url https://download.pytorch.org/whl/cu113
+pip install -e .
+```
+
+### 路径配置
+
+训练和评估脚本通过 `paths.env` 读取路径，首次使用需配置：
+
+```bash
+# paths.env（不提交 git）
+export SIMVLA_SMOLVLM_MODEL='/datasets/models/smolvlm/SmolVLM-500M-Instruct'
+export LIBERO_DATASETS='/datasets/liber-datasets'
+export SIMVLA_CHECKPOINTS='/datasets/models/simvla-model/model'
+export WANDB_API_KEY="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"
+export WANDB_PROJECT="simvla"
+```
+
+---
 
 ## 常用命令
 
 **准备数据集元数据**（一次性）：
 ```bash
 python create_libero_meta.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
+    --data_dir /datasets/liber-datasets \
+    --subsets libero_goal  \
     --output ./datasets/metas/libero_train.json
 ```
 
 **计算归一化统计量**（一次性）：
 ```bash
 python compute_libero_norm_stats.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
+    --data_dir /datasets/liber-datasets \
+    --subsets libero_goal \
     --output ./norm_stats/libero_norm.json
 ```
 
@@ -40,6 +86,11 @@ python finetune_offline_rl.py  # Advantage-Weighted Regression，在已有 check
 路径从 `paths.env` 自动读取。在 `simvla` 环境下启动服务器，在 `libero` 环境下跑客户端。
 
 ```bash
+# 加载路径配置
+source paths.env
+```
+
+```bash
 # 方式一：一键串行跑全部 4 个套件（脚本自动启动服务器）
 # 注意：libero_client.py 需要 libero conda 环境
 cd evaluation/libero
@@ -47,22 +98,28 @@ bash run_eval_serial.sh [port] [num_trials] [output_prefix] [gpu_server] [gpu_cl
 # 默认：port=8102, trials=50, gpu_server=0, gpu_client=1
 bash run_eval_serial.sh 8102 50 eval_simvla 0 1
 
-# 方式二：手动分两个终端
+# 方式二：手动分两个终端（推荐，便于调试）
 # 终端 1（simvla 环境）— 启动推理服务器
+conda activate simvla
 CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
-    --checkpoint /datasets/models/simvla-model/model \
+    --checkpoint ./runs/simvla_hypernet/ckpt-40000 \
     --norm_stats ./norm_stats/libero_norm.json \
     --smolvlm_model /datasets/models/smolvlm/SmolVLM-500M-Instruct \
     --port 8102
 
 # 终端 2（libero 环境）— 跑单个套件
+conda activate libero
 cd evaluation/libero
-CUDA_VISIBLE_DEVICES=1 python libero_client.py \
+CUDA_VISIBLE_DEVICES=0 python libero_client.py \
     --host 127.0.0.1 --port 8102 \
     --client_type websocket \
-    --task_suite libero_spatial \
-    --num_trials 20
+    --task_suite libero_goal \
+    --num_trials 50
 ```
+
+可选 `--task_suite`：`libero_spatial`、`libero_object`、`libero_goal`、`libero_10`
+
+评估结果保存在 `evaluation/libero/eval_results/` 目录下。
 
 `run_eval_all.sh` 需要 4 张卡并行，本机双卡不适用。
 
