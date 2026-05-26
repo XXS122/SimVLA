@@ -26,9 +26,10 @@ RESUME_CKPT=${4:-"${SIMVLA_RESUME_CKPT:-}"}
 # =============================================================================
 SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}"
 LIBERO_DATA_DIR="${LIBERO_DATASETS:?请先 source paths.env 或设置 LIBERO_DATASETS}"
-TRAIN_METAS_PATH="./datasets/metas/libero_goal_train.json"
-NORM_STATS_PATH="./datasets/metas/libero_goal_norm.json"
-SUBSET="libero_goal"
+TRAIN_METAS_PATH="./datasets/metas/libero_small_train.json"
+NORM_STATS_PATH="./datasets/metas/libero_small_norm.json"
+# 空格分隔，按需增减：libero_goal libero_spatial libero_object libero_10
+SUBSETS="libero_goal"
 
 # GPU 配置
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0}"
@@ -69,7 +70,7 @@ if [ ! -f "$TRAIN_METAS_PATH" ]; then
     echo "[Step 1] 生成训练元数据..."
     python create_libero_meta.py \
         --data_dir "$LIBERO_DATA_DIR" \
-        --subsets "$SUBSET" \
+        --subsets $SUBSETS \
         --output "$TRAIN_METAS_PATH"
 else
     echo "[Step 1] 元数据已存在，跳过: $TRAIN_METAS_PATH"
@@ -82,7 +83,7 @@ if [ ! -f "$NORM_STATS_PATH" ]; then
     echo "[Step 2] 计算归一化统计量..."
     python compute_libero_norm_stats.py \
         --data_dir "$LIBERO_DATA_DIR" \
-        --subsets "$SUBSET" \
+        --subsets $SUBSETS \
         --output "$NORM_STATS_PATH"
 else
     echo "[Step 2] 归一化统计已存在，跳过: $NORM_STATS_PATH"
