@@ -111,6 +111,10 @@ HIDDEN_SIZE=1024
 DEPTH=24
 NUM_HEADS=16
 
+# 创新模块 (默认全开)
+USE_CTAF=true
+USE_PSCA=true
+
 # =============================================================================
 # Step 4: 构建训练参数
 # =============================================================================
@@ -134,6 +138,9 @@ ARGS="--output_dir ${OUTPUT_DIR} \
     --image_size 384 \
     --norm_stats_path ${NORM_STATS_PATH} \
     --max_grad_norm ${MAX_GRAD_NORM}"
+
+[ "${USE_CTAF}" = true ] && ARGS="${ARGS} --use_ctaf"
+[ "${USE_PSCA}" = true ] && ARGS="${ARGS} --use_psca"
 
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
