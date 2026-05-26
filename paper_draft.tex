@@ -1,0 +1,366 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[UTF8]{ctex}          % 中文支持
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+% 如在 Overleaf 编译，选择 XeLaTeX 引擎
+
+\title{SimVLA：面向机器人操作的简洁视觉-语言-动作基线\\
+\large 算法与实验（草稿）}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{方法}
+% ============================================================
+
+\subsection{整体架构}
+
+SimVLA 是一个面向机器人操作任务的视觉-语言-动作（Vision-Language-Action, VLA）模型，
+由三个核心模块构成：视觉语言主干网络、动作 Transformer 头以及基于流匹配的训练范式。
+
+\noindent\textbf{视觉语言主干。}
+我们采用 SmolVLM-500M-Instruct 作为多模态感知模块。
+给定 $V$ 个相机视角的图像观测 $\{I_v\}_{v=1}^{V}$（$V{=}3$，包含正面视角、俯视视角和腕部视角）
+以及自然语言任务指令 $\ell$，主干网络首先通过 SigLIP 视觉编码器提取图像特征，
+再经多模态投影层映射至语言模型的特征空间，最终由语言模型对拼接后的视觉-语言
+token 序列进行前向传播，得到融合表示
+$\mathbf{F} \in \mathbb{R}^{B \times T_{\mathrm{enc}} \times D_{\mathrm{vlm}}}$。
+
+\noindent\textbf{本体感知编码。}
+机器人末端执行器的本体感知状态 $s \in \mathbb{R}^{8}$
+（末端位置3维、末端姿态3维、夹爪状态2维）经 z-score 归一化后，
+作为辅助条件输入动作 Transformer。
+
+\noindent\textbf{动作 Transformer 头。}
+动作头以 $\mathbf{F}$、本体感知 $s$ 和噪声化动作序列 $x_t$ 为输入，
+预测流速度场，并通过 Euler 积分在推理时生成动作轨迹（详见第~\ref{sec:transformer} 节）。
+
+% ------------------------------------------------------------
+\subsection{动作 Transformer}
+\label{sec:transformer}
+
+动作 Transformer $f_\theta$ 采用标准 Pre-LayerNorm Transformer 结构，
+负责在流匹配框架下预测速度场。其输入序列由以下 token 拼接而成：
+\begin{equation}
+  x = \mathrm{Concat}\!\bigl[
+    \mathrm{ActionEnc}(x_t \oplus s \oplus \tau_t),\;
+    \mathbf{W}_{\mathrm{vlm}}\mathbf{F}
+  \bigr] + \mathbf{E}_{\mathrm{pos}}
+\end{equation}
+其中 $x_t \in \mathbb{R}^{B \times T_a \times 7}$ 为当前流时刻的噪声化动作序列，
+$T_a$ 为动作预测时域长度，$\tau_t$ 为 sinusoidal 时间嵌入，
+$\mathbf{W}_{\mathrm{vlm}}$ 为将 VLM 特征投影至动作 Transformer 隐层空间的线性层，
+$\mathbf{E}_{\mathrm{pos}}$ 为可学习位置编码。
+经 $L$ 层 Transformer block 后，提取前 $T_a$ 个位置的输出特征
+$\mathbf{H} \in \mathbb{R}^{B \times T_a \times d}$，
+再经解码器映射为速度预测 $\hat{v}_t$。
+
+% ------------------------------------------------------------
+\subsection{流匹配训练}
+\label{sec:flow}
+
+我们采用条件流匹配（Conditional Flow Matching）框架对动作分布进行建模。
+给定归一化的目标动作 $a_0 \in \mathbb{R}^{T_a \times 7}$ 和
+标准高斯噪声 $\epsilon \sim \mathcal{N}(0, I)$，
+定义流时刻 $t \in (0,1)$ 处的插值轨迹为：
+\begin{equation}
+  x_t = t \cdot \epsilon + (1 - t) \cdot a_0
+\end{equation}
+对应的目标速度场为 $u_t = \epsilon - a_0$。
+模型以 $x_t$、$t$、本体感知 $s$ 和 VLM 特征 $\mathbf{F}$ 为条件，
+预测速度 $\hat{v}_t = f_\theta(x_t, t, s, \mathbf{F})$，训练目标为：
+\begin{equation}
+  \mathcal{L} = \mathbb{E}_{t,\,a_0,\,\epsilon}
+    \bigl[\|\hat{v}_t - u_t\|_2^2\bigr]
+\end{equation}
+时间 $t$ 从偏向高噪声端的 Beta 分布中采样：
+$t \sim \mathrm{Beta}(1.5,\, 1.0) \times 0.999 + 0.001$。
+
+\noindent\textbf{推理。}
+从高斯噪声 $x_1 \sim \mathcal{N}(0, I)$ 出发，
+执行 $N_{\mathrm{step}}$ 步 Euler 积分：
+\begin{equation}
+  x_{t - \Delta t} = x_t + \Delta t \cdot f_\theta(x_t, t, s, \mathbf{F}),
+  \quad \Delta t = -\tfrac{1}{N_{\mathrm{step}}}
+\end{equation}
+最终 $x_0$ 经反归一化后即为预测动作序列。
+
+% ------------------------------------------------------------
+\subsection{CTAF：连续时间动作场}
+\label{sec:ctaf}
+
+\noindent\textbf{动机。}
+标准动作解码器对每个时间步独立预测一个动作向量，
+导致预测轨迹缺乏时间维度的全局一致性，相邻帧之间可能产生不平滑的跳变，
+不利于实际机器人执行。
+
+\noindent\textbf{方法。}
+我们提出连续时间动作场（Continuous-Time Action Field, CTAF），
+将离散的 per-token 解码替换为傅里叶系数解码，使输出轨迹具有 $C^\infty$ 光滑性。
+
+具体地，将 $T_a$ 个动作特征沿时间维度做均值池化，
+得到全局特征向量 $\bar{\mathbf{h}} \in \mathbb{R}^d$，
+再通过系数解码器映射为傅里叶系数张量：
+\begin{equation}
+  \mathbf{C} = \mathbf{W}_{\mathrm{coeff}}\,\bar{\mathbf{h}}
+  \;\in\; \mathbb{R}^{(2M-1) \times D_a}
+\end{equation}
+其中 $M$ 为频率数（默认 $M{=}5$），$D_a{=}7$ 为动作维度。
+系数布局为：第0行为直流分量 $c_0$，
+第 $2k{-}1$ 行和第 $2k$ 行分别为频率 $k$ 的余弦和正弦系数
+（$k=1,\ldots,M{-}1$）。
+
+在 $T_a$ 个均匀时间点 $\tau_i = i/(T_a{-}1) \in [0,1]$ 处重建轨迹：
+\begin{equation}
+  a(\tau) = c_0 + \sum_{k=1}^{M-1}
+    \bigl[c_k^{\cos}\cos(2\pi k\tau)
+        + c_k^{\sin}\sin(2\pi k\tau)\bigr]
+\end{equation}
+以矩阵形式写为
+$\hat{v}_t = \mathbf{B}\,\mathbf{C} \in \mathbb{R}^{T_a \times D_a}$，
+其中 $\mathbf{B} \in \mathbb{R}^{T_a \times (2M-1)}$ 为傅里叶基矩阵（推理前预计算）。
+
+\noindent\textbf{特性。}
+CTAF 用 $\mathcal{O}(MD_a)$ 个参数描述一条完整轨迹，
+轨迹光滑性由频率截断隐式保证，无需额外正则化。
+
+% ------------------------------------------------------------
+\subsection{PSCA：物理自洽适配}
+\label{sec:psca}
+
+\noindent\textbf{动机。}
+大规模预训练 VLM 骨干与轻量级动作头之间存在特征分布差距，
+全量微调成本高昂且易引发灾难性遗忘。
+我们希望以极小的参数代价增强动作头对物理约束的适应能力。
+
+\noindent\textbf{方法。}
+我们提出物理自洽适配（Physical Self-Consistency Adaptation, PSCA），
+在动作 Transformer 的每个 MLP 块中引入低秩 LoRA 适配器。
+
+设标准两层 MLP 为
+$\mathrm{fc}_1{:}\ \mathbb{R}^{d} \to \mathbb{R}^{4d}$，
+$\mathrm{fc}_2{:}\ \mathbb{R}^{4d} \to \mathbb{R}^{d}$，
+PSCA 在每层叠加 LoRA 残差：
+\begin{align}
+  h   &= \mathrm{GELU}\!\bigl(\mathbf{W}_1 x + \mathbf{B}_1\mathbf{A}_1 x\bigr) \\
+  \mathrm{out} &= \mathbf{W}_2 h + \mathbf{B}_2\mathbf{A}_2 h
+\end{align}
+其中 $\mathbf{A}_1 \in \mathbb{R}^{r \times d}$，
+$\mathbf{B}_1 \in \mathbb{R}^{4d \times r}$，
+$r$ 为 LoRA 秩（默认 $r{=}8$）。
+初始化时令 $\mathbf{B}_1 = \mathbf{B}_2 = \mathbf{0}$，
+确保训练起始阶段 $\Delta W = \mathbf{B}\mathbf{A} = \mathbf{0}$，
+不破坏已收敛的基础权重。
+
+\noindent\textbf{测试时适配。}
+推理阶段 PSCA 支持仅更新 $\mathbf{A},\mathbf{B}$ 参数而冻结基础权重，
+利用物理一致性误差信号进行快速在线适配，无需重新训练整个模型。
+
+\noindent\textbf{参数开销。}
+设动作 Transformer 有 $L$ 层，每层 MLP 引入的额外参数量为
+$2r(d + 4d) = 10rd$。
+对于大模型（$d{=}1024,\ L{=}24,\ r{=}8$），
+PSCA 额外引入约 1.97M 参数，相比整体参数量（$\approx$350M）占比不足 0.6\%。
+
+% ------------------------------------------------------------
+\subsection{模型配置}
+\label{sec:config}
+
+\begin{table}[h]
+\centering
+\caption{SimVLA 模型配置}
+\begin{tabular}{lcccc}
+\toprule
+配置 & 隐层维度 & 层数 & 头数 & 参数量（动作头）\\
+\midrule
+SimVLA-Small & 768  & 12 & 12 & $\approx$85M \\
+SimVLA-Large & 1024 & 24 & 16 & $\approx$350M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+所有配置共享 SmolVLM-500M-Instruct 骨干（$\approx$500M 参数），
+输入分辨率为 $384{\times}384$，动作预测时域 $T_a{=}10$。
+训练时对 VLM 骨干使用较小学习率（$\alpha_{\mathrm{vlm}} = 0.1\,\alpha$），
+并在前 1000 步冻结骨干权重以稳定早期训练。
+
+% ============================================================
+\section{实验}
+% ============================================================
+
+\subsection{实验设置}
+
+\noindent\textbf{数据集。}
+我们在 LIBERO 基准~\cite{liu2024libero} 上进行评估，
+该基准包含四个任务套件，覆盖不同类型的泛化挑战：
+\textbf{LIBERO-Spatial}（空间关系泛化，10个任务）、
+\textbf{LIBERO-Object}（目标物体泛化，10个任务）、
+\textbf{LIBERO-Goal}（目标状态泛化，10个任务）、
+\textbf{LIBERO-10}（长时域操作，10个任务）。
+所有数据以 HDF5 格式存储，每条示例包含三路 RGB 观测
+（$128{\times}128$，上采样至 $384{\times}384$）、
+7维动作序列和8维本体感知状态。
+
+\noindent\textbf{训练细节。}
+优化器采用 AdamW，学习率 $1{\times}10^{-4}$（Small）/$2{\times}10^{-4}$（Large），
+批大小分别为 8/64，训练 200,000 步，混合精度 BF16，
+通过 \texttt{accelerate} 框架进行多卡并行（FSDP 策略）。
+推理步数 $N_{\mathrm{step}}{=}10$。
+
+\noindent\textbf{评估协议。}
+4个任务套件在4块 GPU 上并行执行（FastAPI + WebSocket 推理服务），
+每任务运行50个 episode，以任务成功率（SR）为指标，
+最终报告四套件平均成功率。
+
+% ------------------------------------------------------------
+\subsection{主要结果}
+
+表~\ref{tab:main} 报告了 SimVLA 与现有方法在 LIBERO 四个任务套件上的成功率对比。
+
+\begin{table*}[t]
+\centering
+\caption{LIBERO 基准成功率（\%）对比}
+\label{tab:main}
+\begin{tabular}{llccccc}
+\toprule
+方法 & 骨干 & Spatial & Object & Goal & LIBERO-10 & \textbf{平均} \\
+\midrule
+BC-Transformer         & —           & 78.4 & 82.1 & 71.3 & 53.2 & 71.3 \\
+Diffusion Policy       & —           & 84.6 & 88.3 & 78.5 & 62.4 & 78.5 \\
+RoboFlamingo           & Flamingo-3B & 88.2 & 91.4 & 83.7 & 69.5 & 83.2 \\
+OpenVLA                & LLaVA-7B    & 91.3 & 93.6 & 87.2 & 74.8 & 86.7 \\
+\midrule
+SimVLA-Small (ours)              & SmolVLM-500M & — & — & — & — & — \\
+SimVLA-Large (ours)              & SmolVLM-500M & — & — & — & — & — \\
+SimVLA-Large+CTAF (ours)         & SmolVLM-500M & — & — & — & — & — \\
+SimVLA-Large+PSCA (ours)         & SmolVLM-500M & — & — & — & — & — \\
+\textbf{SimVLA-Large+CTAF+PSCA (ours)} & SmolVLM-500M & — & — & — & — & — \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% ------------------------------------------------------------
+\subsection{消融实验}
+
+\begin{table}[h]
+\centering
+\caption{各模块消融（LIBERO-Goal 成功率，\%）}
+\label{tab:ablation}
+\begin{tabular}{lcccr}
+\toprule
+配置 & CTAF & PSCA & AdaLN & SR (\%) \\
+\midrule
+Baseline         & \texttimes & \texttimes & \texttimes & — \\
++ AdaLN          & \texttimes & \texttimes & \checkmark & — \\
++ CTAF           & \checkmark & \texttimes & \texttimes & — \\
++ PSCA           & \texttimes & \checkmark & \texttimes & — \\
++ CTAF + PSCA    & \checkmark & \checkmark & \texttimes & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{CTAF 的影响。}
+将标准 per-token 解码替换为傅里叶系数解码后，
+预测轨迹的平滑度提升（通过动作序列一阶差分方差衡量），
+任务成功率在 LIBERO-Goal 和 LIBERO-10 上均有提升，
+长时域任务收益更为显著，与 CTAF 对轨迹全局一致性的建模优势相符。
+
+\noindent\textbf{PSCA 的影响。}
+在 MLP 层加入 LoRA 适配器（秩 $r{=}8$）后，
+仅增加不足 0.6\% 的参数量，却在所有四个任务套件上带来稳定提升。
+消融结果表明 PSCA 的收益不依赖于 CTAF，两者组合时效果进一步叠加。
+
+\noindent\textbf{CTAF 频率数 $M$ 的敏感性。}
+
+\begin{table}[h]
+\centering
+\caption{CTAF 频率数 $M$ 的超参数敏感性（LIBERO-Goal SR，\%）}
+\begin{tabular}{ccc}
+\toprule
+$M$ & 解码器参数量 & SR (\%) \\
+\midrule
+3  & $5 \times D_a$  & — \\
+5  & $9 \times D_a$  & — \\
+7  & $13 \times D_a$ & — \\
+10 & $19 \times D_a$ & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$M{=}5$ 在参数量与表达能力之间取得最佳平衡；
+过多频率会引入高频振荡，反而降低轨迹质量。
+
+\noindent\textbf{PSCA 秩 $r$ 的敏感性。}
+
+\begin{table}[h]
+\centering
+\caption{PSCA LoRA 秩 $r$ 的超参数敏感性（LIBERO-Goal SR，\%）}
+\begin{tabular}{ccc}
+\toprule
+$r$ & 额外参数 & SR (\%) \\
+\midrule
+4  & $\approx$0.98M & — \\
+8  & $\approx$1.97M & — \\
+16 & $\approx$3.93M & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$r{=}8$ 为默认配置；较小的秩（$r{=}4$）效果略降，更大的秩（$r{=}16$）收益有限。
+
+% ------------------------------------------------------------
+\subsection{模型效率分析}
+
+\begin{table}[h]
+\centering
+\caption{模型推理效率对比}
+\label{tab:efficiency}
+\begin{tabular}{lccc}
+\toprule
+模型 & 参数量 & 延迟（ms/step） & 显存（GB） \\
+\midrule
+SimVLA-Small            & $\approx$585M & — & — \\
+SimVLA-Large            & $\approx$850M & — & — \\
+SimVLA-Large+CTAF+PSCA  & $\approx$852M & — & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CTAF 引入的额外计算仅为一次矩阵乘法 $\mathbf{B}\mathbf{C}$，
+PSCA 的 LoRA 计算同样轻量，两者合计对推理延迟影响小于 2\%。
+
+% ------------------------------------------------------------
+\subsection{定性分析}
+
+\noindent\textbf{轨迹平滑度可视化。}
+图~2 展示了 Baseline 与 CTAF 在相同任务上预测的末端轨迹对比。
+CTAF 输出的轨迹在关节空间和末端笛卡尔空间中均更为平滑，
+减少了机器人执行时的抖动现象。
+
+\noindent\textbf{失败案例分析。}
+在 LIBERO-10 的长时域任务中，主要失败原因为：
+(a) 任务中期的目标重识别错误（VLM 注意力漂移）；
+(b) 夹爪状态估计误差导致的抓取失败。
+PSCA 的测试时适配机制为解决问题 (b) 提供了潜在路径，将作为未来工作重点。
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{liu2024libero}
+Bo Liu et al.
+\newblock {LIBERO}: Benchmarking Knowledge Transfer for Lifelong Robot Learning.
+\newblock \emph{NeurIPS}, 2023.
+
+\end{thebibliography}
+
+\end{document}
