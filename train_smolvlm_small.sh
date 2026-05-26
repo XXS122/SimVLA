@@ -19,7 +19,7 @@ set -e
 BATCH_SIZE=${1:-8}
 LEARNING_COEF=${2:-0.1}
 OUTPUT_DIR=${3:-./runs/simvla_libero_small}
-RESUME_CKPT=${4:-""}
+RESUME_CKPT=${4:-"${SIMVLA_RESUME_CKPT:-}"}
 
 # =============================================================================
 # 路径配置 (优先读取环境变量)
@@ -34,9 +34,15 @@ SUBSET="libero_goal"
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0}"
 NUM_GPUS="${NUM_GPUS:-1}"
 
-# 关闭 wandb
-export WANDB_DISABLED=true
-export WANDB_MODE=disabled
+# WandB：有 API key 则启用，否则关闭
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    export WANDB_API_KEY
+    export WANDB_PROJECT="${WANDB_PROJECT:-simvla}"
+    export WANDB_DISABLED=false
+else
+    export WANDB_DISABLED=true
+    export WANDB_MODE=disabled
+fi
 
 # 关闭 TF 日志
 export TF_CPP_MIN_LOG_LEVEL=2

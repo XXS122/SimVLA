@@ -1,49 +1,103 @@
 #!/bin/bash
 # SimVLA Training Script for LIBERO (Large Model)
-# 
-# Key features:
-#   - 384x384 image resolution (SmolVLM requirement)
-#   - All views processed together by VLM (no aux_visual_inputs)
-#   - Larger action transformer configuration
+#
+# 用法:
+#   source paths.env          # 加载路径环境变量
+#   bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+#
+# 依赖环境变量 (paths.env):
+#   SIMVLA_SMOLVLM_MODEL  — SmolVLM 模型路径
+#   LIBERO_DATASETS       — 原始 LIBERO HDF5 数据集根目录
+#   SIMVLA_RESUME_CKPT    — 恢复训练的 checkpoint 路径 (可选)
+#   CUDA_DEVICES          — 使用的 GPU 编号 (默认 "0,1,2,3")
+#   NUM_GPUS              — GPU 数量 (默认 4)
+#   WANDB_API_KEY         — WandB API key (有则启用，无则关闭)
+#   WANDB_PROJECT         — WandB 项目名 (默认 "simvla")
 
 set -e
 
 # =============================================================================
-# Command line arguments (with defaults)
+# 命令行参数 (带默认值)
 # =============================================================================
-
 BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
 OUTPUT_DIR=${3:-./runs/simvla_libero_large}
-RESUME_CKPT=${4:-""}
+RESUME_CKPT=${4:-"${SIMVLA_RESUME_CKPT:-}"}
 
-echo "Training parameters:"
-echo "   batch_size: $BATCH_SIZE"
-echo "   learning_coef: $LEARNING_COEF"
-echo "   output_dir: $OUTPUT_DIR"
-echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
+# =============================================================================
+# 路径配置 (优先读取环境变量)
+# =============================================================================
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}"
+LIBERO_DATA_DIR="${LIBERO_DATASETS:?请先 source paths.env 或设置 LIBERO_DATASETS}"
+TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
+NORM_STATS_PATH="./norm_stats/libero_norm.json"
+SUBSETS="libero_10 libero_goal libero_object libero_spatial"
 
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+# GPU 配置
+export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+NUM_GPUS="${NUM_GPUS:-4}"
 
-# Suppress TensorFlow logs
+# WandB：有 API key 则启用，否则关闭
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    export WANDB_API_KEY
+    export WANDB_PROJECT="${WANDB_PROJECT:-simvla}"
+    export WANDB_DISABLED=false
+else
+    export WANDB_DISABLED=true
+    export WANDB_MODE=disabled
+fi
+
+# 关闭 TF 日志
 export TF_CPP_MIN_LOG_LEVEL=2
 
-# =============================================================================
-# Path configuration
-# =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
-NORM_STATS_PATH="./norm_stats/libero_norm.json"
-TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
+echo "============================================================"
+echo " SimVLA Training (Large) — LIBERO"
+echo "============================================================"
+echo "  SmolVLM backbone : $SMOLVLM_MODEL"
+echo "  LIBERO 数据目录  : $LIBERO_DATA_DIR"
+echo "  元数据文件       : $TRAIN_METAS_PATH"
+echo "  归一化统计       : $NORM_STATS_PATH"
+echo "  输出目录         : $OUTPUT_DIR"
+echo "  Batch size       : $BATCH_SIZE"
+echo "  Learning coef    : $LEARNING_COEF"
+echo "  GPU              : $CUDA_VISIBLE_DEVICES (共 $NUM_GPUS 卡)"
+echo "  Resume           : ${RESUME_CKPT:-'无 (从头训练)'}"
+echo "  WandB            : ${WANDB_API_KEY:+'已启用 (project='$WANDB_PROJECT')'}${WANDB_API_KEY:-'已关闭'}"
+echo "============================================================"
 
-# SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
+# =============================================================================
+# Step 1: 生成训练元数据 (如果不存在)
+# =============================================================================
+mkdir -p "$(dirname $TRAIN_METAS_PATH)"
+if [ ! -f "$TRAIN_METAS_PATH" ]; then
+    echo "[Step 1] 生成训练元数据..."
+    python create_libero_meta.py \
+        --data_dir "$LIBERO_DATA_DIR" \
+        --subsets $SUBSETS \
+        --output "$TRAIN_METAS_PATH"
+else
+    echo "[Step 1] 元数据已存在，跳过: $TRAIN_METAS_PATH"
+fi
 
 # =============================================================================
-# Training hyperparameters
+# Step 2: 计算归一化统计量 (如果不存在)
+# =============================================================================
+mkdir -p "$(dirname $NORM_STATS_PATH)"
+if [ ! -f "$NORM_STATS_PATH" ]; then
+    echo "[Step 2] 计算归一化统计量..."
+    python compute_libero_norm_stats.py \
+        --data_dir "$LIBERO_DATA_DIR" \
+        --subsets $SUBSETS \
+        --output "$NORM_STATS_PATH"
+else
+    echo "[Step 2] 归一化统计已存在，跳过: $NORM_STATS_PATH"
+fi
+
+# =============================================================================
+# Step 3: 训练超参数
 # =============================================================================
 LEARNING_RATE=2e-4
-NUM_ACTIONS=10          # Action horizon
+NUM_ACTIONS=10
 ITERS=200000
 WARMUP_STEPS=0
 FREEZE_STEPS=1000
@@ -52,36 +106,13 @@ LOG_INTERVAL=20
 NUM_WORKERS=4
 MAX_GRAD_NORM=1.0
 
-# Model architecture (Large configuration)
+# 模型架构 (Large)
 HIDDEN_SIZE=1024
 DEPTH=24
 NUM_HEADS=16
-USE_ADALN=false          # DiT-style conditioning
 
 # =============================================================================
-# Step 1: Create training metadata (if not exists)
-# =============================================================================
-if [ ! -f "$TRAIN_METAS_PATH" ]; then
-    echo "Creating training metadata..."
-    python create_libero_meta.py \
-        --data_dir $LIBERO_DATA_DIR \
-        --subsets libero_10 libero_goal libero_object libero_spatial libero_90 \
-        --output $TRAIN_METAS_PATH
-fi
-
-# =============================================================================
-# Step 2: Compute normalization statistics (if not exists)
-# =============================================================================
-if [ ! -f "$NORM_STATS_PATH" ]; then
-    echo "Computing normalization statistics..."
-    python compute_libero_norm_stats.py \
-        --data_dir $LIBERO_DATA_DIR \
-        --subsets libero_10 libero_goal libero_object libero_spatial libero_90 \
-        --output $NORM_STATS_PATH
-fi
-
-# =============================================================================
-# Step 3: Build training arguments
+# Step 4: 构建训练参数
 # =============================================================================
 ARGS="--output_dir ${OUTPUT_DIR} \
     --train_metas_path ${TRAIN_METAS_PATH} \
@@ -104,49 +135,19 @@ ARGS="--output_dir ${OUTPUT_DIR} \
     --norm_stats_path ${NORM_STATS_PATH} \
     --max_grad_norm ${MAX_GRAD_NORM}"
 
-# Add AdaLN flag if enabled
-if [ "${USE_ADALN}" = true ]; then
-    ARGS="${ARGS} --use_adaln"
-fi
-
-# Add resume checkpoint if specified
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
-    echo "Resuming from ${RESUME_CKPT}"
 fi
 
 # =============================================================================
-# Step 4: Start training
+# Step 5: 启动训练
 # =============================================================================
-echo "============================================================"
-echo "Starting SimVLA Training on LIBERO (Large Action Transformer)"
-echo "============================================================"
-echo "SmolVLM backbone: ${SMOLVLM_MODEL}"
-echo "Data directory: $LIBERO_DATA_DIR"
-echo "Normalization stats: $NORM_STATS_PATH"
-echo "Action mode: libero_joint"
-echo "Batch size: ${BATCH_SIZE}"
-echo "Learning rate: ${LEARNING_RATE}"
-echo "Learning coef: ${LEARNING_COEF}"
-echo "Num actions: ${NUM_ACTIONS}"
-echo "Image size: 384x384"
-echo "============================================================"
-echo "Action Transformer configuration:"
-echo "   Hidden size: ${HIDDEN_SIZE}"
-echo "   Depth: ${DEPTH}"
-echo "   Num heads: ${NUM_HEADS}"
-echo "   Use AdaLN: ${USE_ADALN}"
-echo "   Estimated parameters: ~302M"
-echo "============================================================"
-echo "Output directory: ${OUTPUT_DIR}"
-echo "============================================================"
-
-# Multi-GPU training
+echo "[Step 3] 开始训练..."
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=${NUM_GPUS} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}
 
-echo "Training completed!"
+echo "训练完成！输出目录: ${OUTPUT_DIR}"

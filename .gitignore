@@ -12,3 +12,4 @@ env/
 venv/
 *.log
 .DS_Store
+paths.env
