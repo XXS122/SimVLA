@@ -355,7 +355,7 @@ def create_smolvlm_dataloader(
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         worker_init_fn=worker_init_fn,
         persistent_workers=num_workers > 0,
     )
