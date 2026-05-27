@@ -39,7 +39,8 @@ NUM_GPUS="${NUM_GPUS:-1}"
 if [ -n "${WANDB_API_KEY:-}" ]; then
     export WANDB_API_KEY
     export WANDB_PROJECT="${WANDB_PROJECT:-simvla}"
-    export WANDB_DISABLED=false
+    unset WANDB_DISABLED
+    unset WANDB_MODE
 else
     export WANDB_DISABLED=true
     export WANDB_MODE=disabled
