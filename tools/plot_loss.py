@@ -18,10 +18,13 @@ import numpy as np
 
 
 # 匹配形如:
-#   [iter 1000] loss=0.1234  lr=1.0e-04  ...
+#   14:12:19 | INFO | __main__ | [20/200000] loss=0.1234 lr_core=...
+#   [iter 1000] loss=0.1234
 #   step=1000, loss=0.1234
-#   Iter 1000 | loss: 0.1234
 LOG_PATTERNS = [
+    # SimVLA 格式: [step/total] loss=value
+    re.compile(r"\[(\d+)/\d+\]\s+loss=([\d.eE+\-]+)"),
+    # 通用格式
     re.compile(r"iter[=:\s]+(\d+).*?loss[=:\s]+([\d.eE+\-]+)", re.IGNORECASE),
     re.compile(r"step[=:\s]+(\d+).*?loss[=:\s]+([\d.eE+\-]+)", re.IGNORECASE),
     re.compile(r"\[(\d+)\].*?loss[=:\s]+([\d.eE+\-]+)", re.IGNORECASE),
