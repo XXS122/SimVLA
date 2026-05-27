@@ -10,12 +10,20 @@ Observation format:
 """
 from __future__ import annotations
 
+import os
+import sys
+
+# Must be set before any mujoco/OpenGL import.
+# Use osmesa for headless CPU rendering; fall back to egl if explicitly set.
+if "MUJOCO_GL" not in os.environ:
+    os.environ["MUJOCO_GL"] = "osmesa"
+if "PYOPENGL_PLATFORM" not in os.environ:
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+
 import argparse
 import collections
 import json
 import math
-import os
-import sys
 import time
 from datetime import datetime
 from pathlib import Path

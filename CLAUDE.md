@@ -81,6 +81,24 @@ accelerate launch --mixed_precision bf16 train_smolvlm.py \
 
 ## 评估（LIBERO）
 
+### 无头渲染前置条件
+
+LIBERO 评估需要 OpenGL 渲染。Docker/无头服务器环境需安装 OSMesa：
+
+```bash
+# 一次性安装（需要 root，或联系管理员）
+apt-get install -y libosmesa6
+
+# 或者在没有 root 权限时，下载 .deb 并解压到本地目录
+apt-get download libosmesa6
+mkdir -p ~/osmesa_lib && dpkg-deb -x libosmesa6_*.deb ~/osmesa_lib/
+export LD_LIBRARY_PATH=~/osmesa_lib/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+```
+
+`libero_client.py` 和 `run_eval_all.sh` 已自动设置 `MUJOCO_GL=osmesa` 和 `PYOPENGL_PLATFORM=osmesa`，无需手动指定。
+
+### 运行评估
+
 ```bash
 source paths.env
 
