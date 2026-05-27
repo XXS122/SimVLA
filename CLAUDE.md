@@ -84,13 +84,21 @@ accelerate launch --mixed_precision bf16 train_smolvlm.py \
 ```bash
 source paths.env
 
-# Step 1: Start the FastAPI model server
-CUDA_VISIBLE_DEVICES=6 python evaluation/libero/serve_smolvlm_libero.py \
+# Step 1：启动 FastAPI 模型推理服务
+CUDA_VISIBLE_DEVICES=$CUDA_DEVICES python evaluation/libero/serve_smolvlm_libero.py \
     --checkpoint ./runs/simvla_libero_small/ckpt-50000 \
-    --norm_stats ./datasets/metas/libero_goal_norm.json \
+    --norm_stats ./datasets/metas/libero_small_norm.json \
     --port 8102
 
-# Step 2：并行评估全部 4 个 LIBERO 任务套件
+# Step 2a：只评估单个套件（如 libero_goal）
+CUDA_VISIBLE_DEVICES=$CUDA_DEVICES python evaluation/libero/libero_client.py \
+    --host 127.0.0.1 \
+    --port 8102 \
+    --task_suite libero_goal \
+    --num_trials 50 \
+    --output_dir ./eval_results
+
+# Step 2b：并行评估全部 4 个 LIBERO 任务套件
 bash evaluation/libero/run_eval_all.sh 8102 50 "eval_run_name" "0 1 2 3"
 # 参数：<port> <num_trials> <eval_name> <gpu_ids>
 ```
