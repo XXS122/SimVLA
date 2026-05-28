@@ -212,17 +212,21 @@ def eval_libero(
     Run LIBERO evaluation across all tasks in a suite.
     """
     np.random.seed(seed)
+    eval_start_time = time.time()
 
     # Initialize task suite
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks = task_suite.n_tasks
     max_steps = MAX_STEPS.get(task_suite_name, 400)
 
-    Path(video_out_path).mkdir(parents=True, exist_ok=True)
+    if save_video:
+        Path(video_out_path).mkdir(parents=True, exist_ok=True)
 
     print(f"Task suite: {task_suite_name}")
     print(f"   Tasks: {num_tasks}, Trials per task: {num_trials}")
     print(f"   Max steps: {max_steps}")
+    if result_out_path:
+        print(f"   Output folder: {result_out_path}")
 
     total_episodes, total_successes = 0, 0
     task_results: List[Dict] = []
@@ -233,6 +237,7 @@ def eval_libero(
         env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
 
         task_successes = 0
+        first_success_saved = False
         for ep in tqdm(range(num_trials), desc=f"{task_description[:30]}...", leave=False):
             # Reset
             env.reset()
@@ -255,7 +260,9 @@ def eval_libero(
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
-                    if save_video:
+                    # Only record video for: failures, or first success per task
+                    should_record = save_video and (not done or not first_success_saved)
+                    if should_record:
                         replay_images.append(img)
 
                     # Build state vector
@@ -292,12 +299,17 @@ def eval_libero(
 
             total_episodes += 1
 
-            # Save video
+            # Save video: all failures + first success per task
             suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")[:50]
-            video_path = Path(video_out_path) / f"{task_segment}_ep{ep}_{suffix}.mp4"
-            if replay_images and save_video:
-                imageio.mimwrite(str(video_path), replay_images, fps=10)
+            should_save_video = save_video and replay_images and (
+                not done or not first_success_saved
+            )
+            if should_save_video:
+                task_segment = task_description.replace(" ", "_")[:50]
+                vpath = Path(video_out_path) / f"{task_segment}_ep{ep}_{suffix}.mp4"
+                imageio.mimwrite(str(vpath), replay_images, fps=10)
+                if done:
+                    first_success_saved = True
 
             # Print episode result
             status_icon = "[OK]" if done else "[FAIL]"
@@ -315,13 +327,17 @@ def eval_libero(
         })
 
     success_rate = total_successes / max(total_episodes, 1)
-    print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
+    eval_duration = time.time() - eval_start_time
+    duration_str = f"{int(eval_duration // 3600)}h {int((eval_duration % 3600) // 60)}m {int(eval_duration % 60)}s"
+
+    print(f"\n{'='*60}")
+    print(f"Total success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
+    print(f"Total evaluation time: {duration_str}")
 
     # Save results to JSON
     if result_out_path is not None:
         Path(result_out_path).mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H")
-        filename = f"{algo_name}_{timestamp}.json"
+        filename = f"{algo_name}_{task_suite_name}.json"
         result_file = Path(result_out_path) / filename
         result_data = {
             "algo": algo_name,
@@ -329,6 +345,7 @@ def eval_libero(
             "num_trials": num_trials,
             "seed": seed,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_seconds": round(eval_duration, 1),
             "total_successes": total_successes,
             "total_episodes": total_episodes,
             "total_success_rate": round(success_rate, 4),
@@ -337,6 +354,7 @@ def eval_libero(
         with open(result_file, "w") as f:
             json.dump(result_data, f, indent=2, ensure_ascii=False)
         print(f"Results saved to: {result_file}")
+    print(f"{'='*60}")
 
     return success_rate
 
@@ -394,8 +412,16 @@ def main():
     else:
         client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps)
     
-    # Run evaluation
-    video_path = Path(args.video_out) / args.task_suite
+    # Run evaluation — each run gets its own timestamped folder
+    run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.video_out) / f"{args.algo_name}_{args.task_suite}_{run_timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    video_path = run_dir / "videos"
+    result_path = run_dir
+
+    print(f">>> Output folder: {run_dir}")
+    print()
+
     eval_libero(
         client=client,
         task_suite_name=args.task_suite,
@@ -403,7 +429,7 @@ def main():
         seed=args.seed,
         video_out_path=str(video_path),
         save_video=not args.no_video,
-        result_out_path=args.result_out,
+        result_out_path=str(result_path),
         algo_name=args.algo_name,
     )
 

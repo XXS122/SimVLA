@@ -23,3 +23,5 @@ __pycache__/
 *.log
 wandb/
 runs/
+
+evaluation/libero/eval_results

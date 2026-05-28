@@ -474,8 +474,10 @@ class HyperNet(nn.Module):
         self.task_emb_dim = task_emb_dim
 
         H, M, r, D = hidden_size, self.mlp_hidden, rank, task_emb_dim
-        # per-layer output: A_fc1[r,H] + B_fc1[M,r] + A_fc2[r,M] + B_fc2[H,r]
-        per_layer_dim = 2 * rank * (hidden_size + self.mlp_hidden)
+        # A factors: A_fc1[r,H] + A_fc2[r,M]
+        # B factors: B_fc1[M,r] + B_fc2[H,r]
+        a_dim = rank * (hidden_size + self.mlp_hidden)
+        b_dim = rank * (hidden_size + self.mlp_hidden)
 
         # Shared trunk: compress task_vec → compact task embedding
         self.trunk = nn.Sequential(
@@ -483,13 +485,15 @@ class HyperNet(nn.Module):
             nn.Linear(hidden_size, task_emb_dim),
         )
 
-        # Per-layer heads: each independently maps task_emb → layer deltas
-        self.heads = nn.ModuleList([
-            nn.Linear(task_emb_dim, per_layer_dim) for _ in range(num_layers)
+        # Per-layer A-heads: random init so gradients flow from the start
+        self.heads_A = nn.ModuleList([
+            nn.Linear(task_emb_dim, a_dim) for _ in range(num_layers)
         ])
-
-        # Zero-init all heads so deltas start at 0, preserving pretrained weights
-        for head in self.heads:
+        # Per-layer B-heads: zero init so delta=B@A=0 at init (stable start)
+        self.heads_B = nn.ModuleList([
+            nn.Linear(task_emb_dim, b_dim) for _ in range(num_layers)
+        ])
+        for head in self.heads_B:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
 
@@ -510,13 +514,13 @@ class HyperNet(nn.Module):
         feat = self.trunk(task_vec)  # [B, task_emb_dim]
         r, H, M = self.rank, self.hidden_size, self.mlp_hidden
         factors = []
-        for head in self.heads:
-            raw = head(feat)  # [B, 2*r*(H+M)]
-            offset = 0
-            A_fc1 = raw[:, offset:offset + r * H].view(-1, r, H); offset += r * H
-            B_fc1 = raw[:, offset:offset + M * r].view(-1, M, r); offset += M * r
-            A_fc2 = raw[:, offset:offset + r * M].view(-1, r, M); offset += r * M
-            B_fc2 = raw[:, offset:offset + H * r].view(-1, H, r); offset += H * r
+        for head_A, head_B in zip(self.heads_A, self.heads_B):
+            raw_A = head_A(feat)  # [B, r*(H+M)]
+            raw_B = head_B(feat)  # [B, r*(H+M)]
+            A_fc1 = raw_A[:, :r * H].view(-1, r, H)
+            A_fc2 = raw_A[:, r * H:].view(-1, r, M)
+            B_fc1 = raw_B[:, :M * r].view(-1, M, r)
+            B_fc2 = raw_B[:, M * r:].view(-1, H, r)
             factors.append((A_fc1, B_fc1, A_fc2, B_fc2))
         return factors
 
@@ -691,8 +695,8 @@ class SmolVLMActionTransformerV2(nn.Module):
         )
 
         self.apply(basic_init)
-        # Re-zero HyperNet heads after basic_init so deltas start at 0
-        for head in self.hypernet.heads:
+        # Re-zero HyperNet B-heads after basic_init so delta=B@A=0 at init
+        for head in self.hypernet.heads_B:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
 

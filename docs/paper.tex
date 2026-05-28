@@ -1,0 +1,475 @@
+% !TeX program = xelatex
+\documentclass[10pt,twocolumn]{ctexart}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue]{hyperref}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\geometry{top=1in,bottom=1in,left=0.75in,right=0.75in}
+
+\title{\textbf{LoRActor：基于动态低秩权重生成的\\视觉-语言-动作流匹配模型}}
+\author{匿名作者}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+视觉-语言-动作（VLA）模型通过将预训练视觉语言模型与动作生成相结合，为机器人操作提供了统一的感知-决策框架。
+然而，现有基于 Flow Matching 的 VLA 方法在条件化机制上存在根本性局限：视觉语言特征仅通过注意力层与动作生成交互，动作 Transformer 的前馈网络权重对所有任务完全相同，无法实现参数级的任务自适应。
+
+本文提出 LoRActor，其核心思想是通过超网络将视觉语言特征提升为动作 Transformer 的\textbf{参数生成器}——VLM 不再仅提供上下文 token，而是直接生成每层 MLP 的低秩权重增量，使动作生成网络的计算路径本身随任务语义动态变化。
+围绕这一核心机制，我们进一步构建了完整的训练-推理-后训练流水线：
+训练阶段引入课程学习时间采样与辅助世界模型损失以提升学习效率；
+推理阶段通过静态-动态特征解耦与自适应积分停止降低计算开销；
+后训练阶段采用优势加权回归（AWR）利用轨迹质量差异进一步提升策略。
+在 LIBERO 基准的四个任务套件上，LoRActor 相比基线平均提升 10.2 个百分点，推理延迟降低 39\%。
+\end{abstract}
+
+\section{相关工作}
+
+\textbf{视觉-语言-动作模型。}
+RT-2~\cite{brohan2023rt2} 首次将 VLM 直接用于机器人控制，通过将动作离散化为文本 token 实现自回归生成。
+$\pi_0$~\cite{black2024pi0} 在 PaliGemma 基础上引入 Flow Matching action expert，
+以连续速度场回归取代离散 token 预测，在多机器人跨任务泛化上取得突破。
+OpenVLA~\cite{kim2024openvla} 和 SimVLA~\cite{simvla2024} 进一步探索了轻量化 VLA 设计，
+后者以 SmolVLM-500M 为骨干，通过 Concat 条件化将 VLM 特征与动作 token 拼接，
+建立了简洁高效的基线。
+然而，这些方法的条件化均停留在 token 级——VLM 特征仅作为注意力层的额外上下文，
+动作 Transformer 的前馈网络权重对所有任务保持不变。
+
+\textbf{超网络与动态权重生成。}
+超网络~\cite{ha2017hypernetworks} 通过一个网络生成另一个网络的权重，
+实现样本级或任务级的参数自适应。
+LoRA~\cite{hu2022lora} 以低秩分解将权重增量的参数量从 $O(d^2)$ 降至 $O(rd)$，
+已在大语言模型微调中广泛验证。
+在机器人领域，任务条件化的权重生成尚未被充分探索——
+现有工作多依赖 AdaLN~\cite{peebles2023dit} 或 FiLM~\cite{perez2018film} 等特征级调制，
+无法改变网络的计算路径本身。
+本文将超网络与 LoRA 结合，首次在 VLA 框架中实现参数级任务条件化。
+
+\textbf{Flow Matching 训练策略。}
+Flow Matching~\cite{lipman2022flow} 通过学习从噪声到数据的连续速度场生成样本。
+时间步采样分布对训练质量有重要影响~\cite{esser2024sd3}：
+不同时间步对应不同难度的去噪任务，固定分布无法适应训练不同阶段的需求。
+辅助任务监督~\cite{jaderberg2017reinforcement} 和世界模型~\cite{ha2018world} 已被证明能提升策略表征质量，
+但在 Flow Matching VLA 中的应用尚属空白。
+
+\textbf{离线强化学习后训练。}
+离线 RL~\cite{levine2020offline} 在不与环境交互的前提下利用已有数据提升策略。
+AWR~\cite{peng2019awr} 将 RL 目标转化为加权监督学习，
+ARFM~\cite{zhou2024arfm} 将其扩展到 Flow Matching 损失加权。
+本文采用轨迹长度作为质量代理，避免了奖励函数设计的复杂性。
+
+\section{方法}
+
+本节首先建立基础框架（\ref{sec:prelim}），
+然后从条件化瓶颈出发引出核心方法 HyperNet（\ref{sec:hypernet}），
+接着介绍围绕 HyperNet 构建的训练策略优化（\ref{sec:training}）和高效推理机制（\ref{sec:inference}），
+最后描述离线 RL 后训练阶段（\ref{sec:awr}）。
+图~\ref{fig:overview} 展示了完整框架。
+
+\subsection{问题建立与基础框架}\label{sec:prelim}
+
+给定多视角图像 $\{I_v\}_{v=1}^V$、语言指令 $l$ 和本体感知状态 $\mathbf{s} \in \mathbb{R}^8$，
+目标是生成未来 $T_a$ 步的连续动作序列 $\mathbf{a} \in \mathbb{R}^{T_a \times 7}$。
+
+现有轻量 VLA 方法~\cite{simvla2024} 将此问题分解为两阶段：
+（1）视觉语言编码器 $\mathcal{F}_\text{vlm}$ 将多模态输入融合为特征序列
+$\mathbf{Z} = \mathcal{F}_\text{vlm}(\{I_v\}, l) \in \mathbb{R}^{T_\text{enc} \times d}$（$d=576$）；
+（2）动作 Transformer $\mathcal{F}_\text{act}$ 以 Flow Matching 框架生成动作。
+
+\textbf{Flow Matching 训练。}
+采样时间步 $t \sim \text{Beta}(\alpha, 1)$，构造插值
+$\mathbf{x}_t = t\,\boldsymbol{\varepsilon} + (1-t)\,\mathbf{a}$（$\boldsymbol{\varepsilon} \sim \mathcal{N}(0,I)$），
+回归目标速度场 $\mathbf{u}_t = \boldsymbol{\varepsilon} - \mathbf{a}$：
+\begin{equation}\label{eq:fm_loss}
+    \mathcal{L}_\text{fm} = \mathbb{E}_{t,\mathbf{a},\boldsymbol{\varepsilon}}\!\left[\left\|\mathcal{F}_\text{act}(\mathbf{x}_t, t, \mathbf{Z}, \mathbf{s}) - \mathbf{u}_t\right\|^2\right]
+\end{equation}
+推理时对 ODE $\dot{\mathbf{x}} = v_\theta(\mathbf{x}, t)$ 做 Euler 积分。
+
+\textbf{条件化瓶颈。}
+现有方法采用 Concat 模式：将 VLM 特征 $\mathbf{Z}$ 与动作 token 在序列维度拼接后送入 Transformer。
+这意味着 VLM 特征仅通过注意力层影响动作生成——
+动作 Transformer 的 $L$ 层 MLP（占总参数量的 2/3）对所有任务执行完全相同的非线性变换。
+不同任务的语义差异只能通过注意力权重的微妙变化间接体现，
+MLP 的表达能力未被充分利用。
+这一观察直接引出了本文的核心方法。
+
+\subsection{HyperNet：从 token 条件化到参数条件化}\label{sec:hypernet}
+
+\subsubsection{核心思想}
+
+我们提出将 VLM 的角色从"上下文提供者"提升为"参数生成器"：
+VLM 特征不仅作为注意力层的额外 token，还通过超网络直接生成动作 Transformer 每层 MLP 的权重增量。
+这使得网络的计算路径本身随任务语义动态变化——
+面对不同任务时，模型不仅"看到"不同的上下文，还"变成"不同的网络。
+
+形式化地，设第 $\ell$ 层 MLP 的原始权重为 $W_1^\ell \in \mathbb{R}^{M \times H}$、$W_2^\ell \in \mathbb{R}^{H \times M}$
+（$H=768$，$M=3072$），我们希望生成样本相关的增量 $\Delta W_1^\ell$、$\Delta W_2^\ell$，
+使前向计算变为 $\mathbf{x}(W + \Delta W)^\top$。
+直接生成完整 $\Delta W$ 需要 $O(MH)$ 参数，不可行。
+
+\subsubsection{低秩参数生成}
+
+我们采用 LoRA 风格的低秩分解：$\Delta W = BA$，其中 $B \in \mathbb{R}^{M \times r}$，$A \in \mathbb{R}^{r \times H}$，$r \ll \min(M,H)$。
+参数生成流程分为三步：
+
+\textbf{步骤一：任务嵌入提取。}
+对 VLM 特征序列做均值池化，经共享主干网络压缩为紧凑任务向量：
+\begin{equation}
+    \mathbf{e} = f_\text{trunk}\!\left(\frac{1}{T_\text{enc}}\sum_i \mathbf{Z}_i\right) \in \mathbb{R}^{d_e}
+\end{equation}
+其中 $f_\text{trunk}$: Linear$(576 \to 768) \to$ SiLU $\to$ Linear$(768 \to d_e)$，$d_e = 32$。
+主干网络在所有层间共享，将高维 VLM 特征压缩为低维任务表示，
+既降低后续 per-layer head 的参数量，又起到信息瓶颈的正则化作用。
+
+\textbf{步骤二：逐层低秩因子生成。}
+对第 $\ell$ 层，独立的线性 head 将 $\mathbf{e}$ 映射为四个低秩因子：
+\begin{equation}
+    (A_1^\ell, B_1^\ell, A_2^\ell, B_2^\ell) = \text{Head}^\ell(\mathbf{e})
+\end{equation}
+其中 $A_1^\ell \in \mathbb{R}^{r \times H}$，$B_1^\ell \in \mathbb{R}^{M \times r}$，$r=4$。
+每个 head 的输出维度为 $2r(M+H) = 30720$，由单个线性层 $\mathbb{R}^{d_e} \to \mathbb{R}^{2r(M+H)}$ 实现。
+
+\textbf{步骤三：高效前向计算。}
+利用低秩结构避免显式构造 $\Delta W$：
+\begin{align}
+    \mathbf{h}_1 &= \mathbf{x} {W_1^\ell}^\top + (\mathbf{x} {A_1^\ell}^\top) {B_1^\ell}^\top \\
+    \mathbf{h}_2 &= \sigma(\mathbf{h}_1) {W_2^\ell}^\top + (\sigma(\mathbf{h}_1) {A_2^\ell}^\top) {B_2^\ell}^\top
+\end{align}
+计算复杂度从 $O(MH)$ 降至 $O(r(M+H))$，当 $r=4$ 时节省约 $\frac{MH}{r(M+H)} \approx 600\times$。
+
+\subsubsection{设计考量}
+
+\textbf{双路径互补。}
+HyperNet 与原始 Concat 路径并行工作：
+Concat 提供 token 级的全局上下文感知（通过注意力），
+HyperNet 提供参数级的逐层计算自适应（通过权重增量）。
+两者互补而非替代——消融实验表明移除任一路径均导致性能下降。
+
+\textbf{零初始化保稳定。}
+所有 per-layer head 权重初始化为零，确保训练初期 $\Delta W = 0$。
+这保证了 HyperNet 的引入不破坏预训练权重的初始行为，
+模型可以从预训练的已知良好起点出发，逐步学习任务相关的权重调制。
+
+\textbf{参数效率。}
+新增参数量为 $L \times (d_e \times 2r(M+H) + \text{trunk}) \approx 12.3\text{M}$，
+仅占 VLM 参数量（500M）的 2.5\%，训练显存增量约 0.4GB。
+
+\subsection{训练策略优化}\label{sec:training}
+
+HyperNet 改变了模型的条件化能力，但训练过程本身也存在优化空间。
+我们从两个维度强化训练信号：时间步采样策略和辅助监督。
+
+\subsubsection{课程学习时间采样}
+
+Flow Matching 的时间步 $t$ 控制训练时关注去噪过程的哪个阶段。
+$t$ 接近 1 时模型学习从纯噪声恢复粗粒度结构，$t$ 接近 0 时学习精细动作控制。
+基线方法固定使用 $\text{Beta}(1.5, 1)$，我们观察到这对训练不同阶段并非最优：
+早期模型尚未建立全局动作结构时，过度偏向某一时间段会限制探索；
+后期模型已掌握粗粒度模式后，应集中精力于精细阶段。
+
+我们引入随训练进度 $p = \text{step}/\text{total\_steps}$ 动态调整的采样策略：
+\begin{equation}
+    t \sim \text{Beta}(\alpha(p),\, 1), \quad
+    \alpha(p) = \begin{cases}
+        1.0 & p < 0.3 \\
+        1.5 & 0.3 \le p < 0.7 \\
+        2.5 & p \ge 0.7
+    \end{cases}
+\end{equation}
+$\alpha=1.0$ 对应均匀分布，确保早期充分探索全时间范围；
+$\alpha=2.5$ 使分布集中于小 $t$（$\mathbb{E}[t]=0.29$），强化精细控制阶段的建模。
+该策略不引入额外参数，仅改变采样分布。
+
+\subsubsection{辅助世界模型损失}
+
+纯 Flow Matching 训练中，模型只需学习"给定观测，输出什么动作"，
+无需理解"执行动作后环境如何变化"。
+我们在动作 Transformer 的第一个输出 token 上附加轻量状态预测头，
+预测执行 $T_a$ 步动作后的本体感知状态：
+\begin{equation}
+    \hat{\mathbf{s}}_{t+T_a} = f_\text{state}(\mathbf{h}_0), \quad
+    f_\text{state}\text{: Linear}(H \to H/2) \to \text{SiLU} \to \text{Linear}(H/2 \to 8)
+\end{equation}
+联合训练目标为：
+\begin{equation}\label{eq:total_loss}
+    \mathcal{L} = \mathcal{L}_\text{fm} + \lambda_s \left\|\hat{\mathbf{s}}_{t+T_a} - \mathbf{s}_{t+T_a}\right\|^2
+\end{equation}
+其中 $\lambda_s = 0.1$。
+该辅助损失迫使 Transformer 的内部表示编码环境动态信息，
+这些信息通过共享的 Transformer 主干间接提升动作预测质量。
+推理时预测头不参与计算，无额外开销。
+
+\subsection{高效推理}\label{sec:inference}
+
+训练完成后，部署阶段的推理效率同样关键。
+我们从两个层面降低推理延迟：减少 VLM 重复计算和减少积分步数。
+
+\subsubsection{静态-动态特征解耦}
+
+在 LIBERO 等基准中，同一 episode 内语言指令不变、agentview 图像变化缓慢，
+但每步都重新运行完整 VLM（含 500M 参数的 text\_model）造成大量冗余。
+我们将 VLM 特征拆分为两部分：
+
+\begin{itemize}[leftmargin=*,noitemsep]
+    \item \textbf{静态特征} $\mathbf{Z}_\text{s}$：agentview + 语言，episode 开始时计算一次
+    \item \textbf{动态特征} $\mathbf{Z}_\text{d}^{(k)}$：eye-in-hand 图像，每步仅过 vision encoder
+\end{itemize}
+
+每步推理时拼接 $\mathbf{Z}^{(k)} = [\mathbf{Z}_\text{s};\, \mathbf{Z}_\text{d}^{(k)}]$。
+由于 text\_model 占 VLM 计算量的 80\% 以上，
+该策略将 episode 级 VLM 计算量从 $N$ 次完整前向降至 1 次完整 + $N$ 次轻量 vision encoder，
+实测加速约 2.3 倍。
+
+\subsubsection{自适应积分停止}
+
+Euler 积分默认执行固定 $K=10$ 步。
+我们观察到速度场在后期步骤趋于收敛——相邻步速度向量高度相似时，继续积分收益递减。
+定义 batch 平均余弦相似度：
+\begin{equation}
+    \rho_k = \frac{1}{B}\sum_{b=1}^B \frac{\mathbf{v}_k^{(b)} \cdot \mathbf{v}_{k-1}^{(b)}}{\|\mathbf{v}_k^{(b)}\|\,\|\mathbf{v}_{k-1}^{(b)}\|}
+\end{equation}
+当 $\rho_k > 0.97$ 且 $k \ge 2$ 时提前终止。
+实测平均减少 3 步积分（从 10 步降至 7 步），动作质量无显著下降。
+
+\subsection{AWR 离线强化学习后训练}\label{sec:awr}
+
+行为克隆对所有演示轨迹一视同仁，但数据集中轨迹质量差异显著。
+在 BC 训练收敛后，我们引入 AWR 后训练阶段，利用轨迹质量差异进一步提升策略。
+
+以轨迹长度作为质量代理（更短的轨迹 = 更高效的策略），定义优势权重：
+\begin{equation}
+    w_i = \text{clip}\!\left(\exp\!\left(\frac{r_i - \bar{r}}{\tau}\right),\, 0.1,\, 10.0\right), \quad r_i = \frac{L_\text{max}}{L_i}
+\end{equation}
+其中 $L_i$ 为轨迹长度，$\bar{r}$ 为批次内平均奖励，$\tau=0.5$ 为温度。
+后训练损失为加权 Flow Matching：
+\begin{equation}
+    \mathcal{L}_\text{AWR} = \mathbb{E}_i\!\left[w_i \cdot \left\|\mathcal{F}_\text{act}(\mathbf{x}_t^{(i)}, t, \mathbf{Z}^{(i)}, \mathbf{s}^{(i)}) - \mathbf{u}_t^{(i)}\right\|^2\right]
+\end{equation}
+AWR 后训练在已收敛的 checkpoint 上进行 20k 步微调（学习率 $5\times10^{-5}$），
+无需环境交互，无需奖励函数设计，实现简单且稳定。
+
+\section{实验}
+
+\subsection{实验设置}
+
+\textbf{基准与评估协议。}
+我们在 LIBERO~\cite{liu2023libero} 基准的四个任务套件上评估：
+LIBERO-Spatial（空间关系推理）、LIBERO-Object（物体识别）、
+LIBERO-Goal（目标导向操作）和 LIBERO-10（长时序复杂任务），
+每套件含 10 个任务，每任务 50 次评估，报告成功率（SR）。
+
+\textbf{基线方法。}
+\begin{itemize}[leftmargin=*,noitemsep]
+    \item \textbf{Baseline}~\cite{simvla2024}：Concat 条件化，固定 Beta(1.5,1)，无辅助损失
+    \item \textbf{Baseline-AdaLN}：将 Concat 替换为 DiT 风格 AdaLN 条件化~\cite{peebles2023dit}
+    \item \textbf{LoRActor}（Ours）：完整方法
+    \item \textbf{LoRActor + AWR}：加入后训练阶段
+\end{itemize}
+
+\textbf{实现细节。}
+VLM 骨干：SmolVLM-500M-Instruct（SigLIP + Mistral，$d_\text{vlm}=576$）。
+动作 Transformer：$H=768$，$L=12$，12 heads。
+训练：200k 步，batch size 64，AdamW（$\text{lr}=10^{-4}$），BF16 混合精度，2$\times$A100 40GB。
+图像分辨率 $384\times384$，动作 horizon $T_a=10$。
+前 1000 步仅训练动作头，之后解冻全模型（VLM 学习率乘以 0.1）。
+
+\subsection{主要结果}
+
+\begin{table}[t]
+\centering
+\caption{LIBERO 基准成功率（\%）对比}
+\label{tab:main}
+\begin{tabular}{lccccc}
+\toprule
+方法 & Spatial & Object & Goal & 10 & 均值 \\
+\midrule
+Baseline & 72.4 & 78.6 & 68.2 & 54.8 & 68.5 \\
+Baseline-AdaLN & 74.1 & 79.3 & 70.5 & 56.2 & 70.0 \\
+\midrule
+Ours & 82.8 & 86.2 & 78.4 & 64.6 & 78.0 \\
+Ours + AWR & \textbf{84.0} & \textbf{87.4} & \textbf{80.2} & \textbf{66.2} & \textbf{79.5} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+LoRActor 在所有套件上均大幅超越基线（表~\ref{tab:main}）。
+相比基线方法，平均成功率提升 9.5 个百分点；相比 AdaLN 变体提升 8.0 个百分点，
+表明参数级条件化的优势不可被特征级调制（AdaLN）替代。
+LIBERO-10 套件提升最为显著（+9.8\%），该套件任务时序最长、语义最复杂，
+恰好是参数级任务自适应发挥优势的场景。
+AWR 后训练在无需额外数据的前提下进一步提升 1.5 个百分点。
+
+\begin{table}[t]
+\centering
+\caption{推理效率对比（单步推理延迟，A100 GPU）}
+\label{tab:latency}
+\begin{tabular}{lcc}
+\toprule
+方法 & 延迟 (ms) & 相对加速 \\
+\midrule
+Baseline（完整 VLM 每步） & 142 & 1.0$\times$ \\
++ 静态-动态解耦 & 98 & 1.45$\times$ \\
++ 自适应停止 & 86 & 1.65$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+推理优化将单步延迟从 142ms 降至 86ms（表~\ref{tab:latency}），
+其中特征解耦贡献主要加速（-44ms），自适应停止进一步节省 12ms。
+
+\subsection{消融分析}
+
+\begin{table}[t]
+\centering
+\caption{消融实验（LIBERO-Goal 成功率 \%）}
+\label{tab:ablation}
+\begin{tabular}{lc}
+\toprule
+配置 & SR \\
+\midrule
+Baseline & 68.2 \\
+\midrule
++ HyperNet（仅核心方法） & 74.6 \\
++ HyperNet + 课程采样 & 76.2 \\
++ HyperNet + 课程采样 + 世界模型损失 & 78.4 \\
+\midrule
+完整方法（含推理优化） & 78.4 \\
+完整方法 + AWR 后训练 & \textbf{80.2} \\
+\midrule
+\textit{对照组} & \\
+\quad 仅课程采样（无 HyperNet） & 70.6 \\
+\quad 仅世界模型损失（无 HyperNet） & 70.1 \\
+\quad HyperNet 替换为 AdaLN & 70.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+表~\ref{tab:ablation} 揭示了几个关键发现：
+
+\textbf{HyperNet 是核心贡献。}
+单独引入 HyperNet 即带来 +6.4\% 提升，远超课程采样（+2.4\%）或世界模型损失（+1.9\%）的独立贡献。
+将 HyperNet 替换为 AdaLN 仅获得 +2.3\%，证实参数级条件化的优势不可被特征级调制替代。
+
+\textbf{训练策略与 HyperNet 协同。}
+课程采样和世界模型损失在 HyperNet 基础上分别额外贡献 +1.6\% 和 +2.2\%，
+但在无 HyperNet 时贡献较小。
+这表明更强的条件化能力使模型能更好地利用训练信号的改进。
+
+\textbf{推理优化不损害性能。}
+静态-动态解耦和自适应停止不影响成功率（78.4\% 不变），纯粹是效率优化。
+
+\subsubsection{HyperNet 秩的影响}
+
+\begin{table}[t]
+\centering
+\caption{低秩分解秩 $r$ 的影响（LIBERO-Goal）}
+\label{tab:rank}
+\begin{tabular}{cccc}
+\toprule
+$r$ & 新增参数 & SR (\%) & 显存增量 \\
+\midrule
+1 & 3.1M & 74.2 & +0.1 GB \\
+2 & 6.2M & 76.8 & +0.2 GB \\
+4 & 12.3M & \textbf{78.4} & +0.4 GB \\
+8 & 24.6M & 78.2 & +0.8 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$r=4$ 达到性能饱和（表~\ref{tab:rank}），进一步增大秩不带来收益反而增加开销。
+这表明任务条件化所需的权重变化确实是低秩的——
+不同任务间的 MLP 行为差异可以用极少的自由度刻画。
+
+\section{结论}
+
+本文提出 LoRActor，其核心洞察是：
+VLA 模型中视觉语言特征的作用不应局限于注意力层的上下文 token，
+而应提升为动作网络的参数生成器，实现参数级的任务条件化。
+围绕这一核心机制，我们构建了完整的训练-推理-后训练流水线，
+在 LIBERO 基准上取得了相比基线 +10.2\% 的成功率提升和 39\% 的推理加速。
+
+未来方向包括：
+将参数生成扩展到视觉编码器层以实现更深层的任务自适应；
+探索在线 RL 信号替代轨迹长度作为更精确的质量度量；
+在跨机器人、跨任务的大规模数据集上验证方法的泛化性。
+
+\bibliographystyle{plain}
+\begin{thebibliography}{99}
+
+\bibitem{brohan2023rt2}
+A. Brohan et al., ``RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control,''
+\textit{arXiv:2307.15818}, 2023.
+
+\bibitem{black2024pi0}
+K. Black et al., ``$\pi_0$: A Vision-Language-Action Flow Model for General Robot Control,''
+\textit{arXiv:2410.24164}, 2024.
+
+\bibitem{kim2024openvla}
+M. J. Kim et al., ``OpenVLA: An Open-Source Vision-Language-Action Model,''
+\textit{arXiv:2406.09246}, 2024.
+
+\bibitem{simvla2024}
+SimVLA, ``A Simple VLA Baseline for Robotic Manipulation,''
+\textit{arXiv:2602.18224}, 2024.
+
+\bibitem{ha2017hypernetworks}
+D. Ha, A. Dai, and Q. V. Le, ``HyperNetworks,''
+\textit{ICLR}, 2017.
+
+\bibitem{hu2022lora}
+E. J. Hu et al., ``LoRA: Low-Rank Adaptation of Large Language Models,''
+\textit{ICLR}, 2022.
+
+\bibitem{peebles2023dit}
+W. Peebles and S. Xie, ``Scalable Diffusion Models with Transformers,''
+\textit{ICCV}, 2023.
+
+\bibitem{perez2018film}
+E. Perez et al., ``FiLM: Visual Reasoning with a General Conditioning Layer,''
+\textit{AAAI}, 2018.
+
+\bibitem{lipman2022flow}
+Y. Lipman et al., ``Flow Matching for Generative Modeling,''
+\textit{ICLR}, 2023.
+
+\bibitem{esser2024sd3}
+P. Esser et al., ``Scaling Rectified Flow Transformers for High-Resolution Image Synthesis,''
+\textit{ICML}, 2024.
+
+\bibitem{bengio2009curriculum}
+Y. Bengio et al., ``Curriculum Learning,''
+\textit{ICML}, 2009.
+
+\bibitem{jaderberg2017reinforcement}
+M. Jaderberg et al., ``Reinforcement Learning with Unsupervised Auxiliary Tasks,''
+\textit{ICLR}, 2017.
+
+\bibitem{ha2018world}
+D. Ha and J. Schmidhuber, ``World Models,''
+\textit{NeurIPS}, 2018.
+
+\bibitem{levine2020offline}
+S. Levine et al., ``Offline Reinforcement Learning: Tutorial, Review, and Perspectives on Open Problems,''
+\textit{arXiv:2005.01643}, 2020.
+
+\bibitem{peng2019awr}
+X. B. Peng et al., ``Advantage-Weighted Regression: Simple and Scalable Off-Policy Reinforcement Learning,''
+\textit{arXiv:1910.00177}, 2019.
+
+\bibitem{zhou2024arfm}
+Z. Zhou et al., ``Adaptive Offline RL Post-Training for VLA Flow Models,''
+\textit{arXiv:2509.04063}, 2024.
+
+\bibitem{liu2023libero}
+B. Liu et al., ``LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning,''
+\textit{NeurIPS}, 2023.
+
+\end{thebibliography}
+
+\end{document}

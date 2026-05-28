@@ -5,10 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本文件为 Claude Code 在此仓库中工作提供指导。
 
 **重要：所有回答请使用中文。**
-## 文件权限
-```bash
-chown -R sapi:sapi /home/sapi/hyj/code/SimVLA/
-```
+
 ## 环境安装
 
 ### simvla 训练环境（Python 3.10）
@@ -39,14 +36,17 @@ pip install -e .
 
 ### 路径配置
 
-训练和评估脚本通过 `paths.env` 读取路径，首次使用需配置：
+训练和评估脚本通过 `paths.env` 读取路径，首次使用需配置（**不提交 git**）：
 
 ```bash
-# paths.env（不提交 git）
+# paths.env
 export SIMVLA_SMOLVLM_MODEL='/datasets/models/smolvlm/SmolVLM-500M-Instruct'
 export LIBERO_DATASETS='/datasets/liber-datasets'
 export SIMVLA_CHECKPOINTS='/datasets/models/simvla-model/model'
-export WANDB_API_KEY="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"
+export SIMVLA_RESUME_CKPT=''          # 续训 checkpoint 路径，留空则从头训练
+export CUDA_DEVICES="0,1"             # 训练脚本使用的 GPU 列表
+export NUM_GPUS=2                     # 对应 GPU 数量
+export WANDB_API_KEY="<your_wandb_api_key>"
 export WANDB_PROJECT="simvla"
 ```
 
@@ -78,7 +78,15 @@ bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ck
 
 **AWR 离线强化学习微调：**
 ```bash
-python finetune_offline_rl.py  # Advantage-Weighted Regression，在已有 checkpoint 上微调
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+accelerate launch --num_processes=2 --mixed_precision bf16 \
+    finetune_offline_rl.py \
+    --checkpoint ./runs/simvla_hypernet/ckpt-50000 \
+    --train_metas_path ./datasets/metas/libero_train.json \
+    --norm_stats_path ./norm_stats/libero_norm.json \
+    --temperature 0.5 --iters 20000 --learning_rate 5e-5 \
+    --output_dir ./runs/awr_finetune
+# 奖励 = max_traj_len / traj_len（轨迹越短权重越高），用加权 BC 损失微调
 ```
 
 **评估（串行，2 张 GPU）：**
@@ -101,20 +109,20 @@ bash run_eval_serial.sh 8102 50 eval_simvla 0 1
 # 方式二：手动分两个终端（推荐，便于调试）
 # 终端 1（simvla 环境）— 启动推理服务器
 conda activate simvla
-CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
-    --checkpoint ./runs/simvla_hypernet/ckpt-40000 \
+python evaluation/libero/serve_smolvlm_libero.py \
+    --checkpoint ./runs/simvla_hypernet/ckpt-80000 \
     --norm_stats ./norm_stats/libero_norm.json \
     --smolvlm_model /datasets/models/smolvlm/SmolVLM-500M-Instruct \
-    --port 8102
+    --port 9999
 
 # 终端 2（libero 环境）— 跑单个套件
 conda activate libero
 cd evaluation/libero
-CUDA_VISIBLE_DEVICES=0 python libero_client.py \
-    --host 127.0.0.1 --port 8102 \
+python libero_client.py \
+    --host 127.0.0.1 --port 9999 \
     --client_type websocket \
     --task_suite libero_goal \
-    --num_trials 50
+    --num_trials 100
 ```
 
 可选 `--task_suite`：`libero_spatial`、`libero_object`、`libero_goal`、`libero_10`
@@ -204,3 +212,24 @@ Flow matching：采样 `t ~ Beta(1.5, 1)`，插值 `x_t = t*noise + (1-t)*action
 - 本机双卡（GPU 0/1），串行跑 4 个评估套件；`run_eval_all.sh` 需要 4 张卡并行，本机不适用
 - 小模型在 GPU 0–3 训练，大模型在 GPU 4–7 训练（在 shell 脚本中配置）
 - 无单元测试或 lint 配置文件
+
+## 单卡（4090）评估示例
+
+```bash
+# 终端 1（simvla 环境）— 启动推理服务器
+conda activate simvla
+CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
+    --checkpoint ./runs/simvla_libero_small/ckpt-100000 \
+    --norm_stats ./norm_stats/libero_norm.json \
+    --smolvlm_model /datasets/models/smolvlm/SmolVLM-500M-Instruct \
+    --port 8102
+
+# 终端 2（libero 环境）— 跑单个套件
+conda activate libero
+cd evaluation/libero
+CUDA_VISIBLE_DEVICES=0 python libero_client.py \
+    --host 127.0.0.1 --port 8102 \
+    --client_type websocket \
+    --task_suite libero_goal \
+    --num_trials 50
+```

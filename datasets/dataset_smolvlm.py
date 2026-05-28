@@ -5,7 +5,7 @@ Dataset classes specifically designed for SmolVLM-VLA training.
 Key differences from the original dataset:
   - Uses 512x512 image resolution (SmolVLM-500M requirement)
   - Handles smaller images by proper upscaling
-  - ImageNet normalization compatible with SmolVLM
+  - ImageNet norssssmalization compatible with SmolVLM
 """
 
 from __future__ import annotations

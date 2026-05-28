@@ -107,7 +107,7 @@ def preprocess_images(image0: np.ndarray, image1: np.ndarray):
     # Pad to 3 views (model processes all views together)
     padding = torch.zeros_like(img0_t)
     images = torch.stack([img0_t, img1_t, padding], dim=0)
-    image_mask = torch.tensor([[True, True, False]])
+    image_mask = torch.tensor([[True, True, False]]) # 对第三个视角补0 视为无效，所以只看前两个视角
     
     return images.unsqueeze(0), image_mask
 

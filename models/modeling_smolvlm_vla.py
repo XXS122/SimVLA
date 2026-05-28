@@ -463,7 +463,7 @@ class SmolVLMVLA(PreTrainedModel):
                 image_input = image_input[:, :, 0]
 
         dyn_img = image_input[:, dynamic_view_idx, ...]  # [B, C, H, W]
-
+        # B 推理服务默认为1 C：视角数量 0 是静态的 1 是动态的
         vision_outputs = self.vlm.model.vision_model(
             pixel_values=dyn_img,
             output_hidden_states=True,

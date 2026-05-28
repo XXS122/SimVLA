@@ -196,7 +196,8 @@ def infer(observation: Dict[str, Any], conn_id: int = None) -> Dict[str, Any]:
                 image_mask=image_mask,
                 dynamic_view_idx=1,
             )
-
+            # 把静态信息(固定相机+文字信息)的内容缓存下来,然后每次循环都读取新的动态信息
+            # actions:拿到未来num_actions步的动作序列
             actions = model.generate_actions_with_cache(
                 static_context=static_context,
                 dynamic_feats=dynamic_feats,
@@ -265,6 +266,7 @@ async def handle_connection(websocket, path=None):
                 # Send response (convert numpy to list for compatibility)
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
+                    
                     actions = actions.tolist()
 
                 response_data = {"actions": actions}
